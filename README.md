@@ -1,6 +1,16 @@
 # Plus Extractor
 
-[![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
+<p align="center">
+  <a href="https://github.com/shi-YangYang/plus-extractor"><img src="https://img.shields.io/badge/version-v0.2-6f42c1?style=flat-square" alt="Version v0.2"></a>
+  <img src="https://img.shields.io/badge/Manifest-V3-4285F4?style=flat-square" alt="Manifest V3">
+  <img src="https://img.shields.io/badge/Chrome-supported-34A853?style=flat-square&logo=googlechrome&logoColor=white" alt="Chrome supported">
+  <img src="https://img.shields.io/badge/Edge-supported-0078D7?style=flat-square&logo=microsoftedge&logoColor=white" alt="Edge supported">
+  <img src="https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js 18 or newer">
+  <br>
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows11&logoColor=white" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/macOS-supported-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS supported">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow?style=flat-square" alt="MIT License"></a>
+</p>
 
 一键提取plus优惠
 
@@ -9,6 +19,8 @@
 Plus Extractor 是一个仅在本地浏览器中运行的 Chrome/Edge Manifest V3 扩展。它把原始书签脚本封装成带登录检测、参数确认、错误反馈和重复提交保护的页面 UI，帮助符合资格的用户更清晰地进入 ChatGPT Plus 官方结账流程。
 
 扩展源码位于 `chatgpt-checkout-helper` 子目录。项目不隶属于 OpenAI，也不保证任何促销资格或优惠结果。
+
+US和UR代理在：`https://www.kookeey.com`，注册免费送2G流量，非广、非广、非广！！
 
 ## 目录
 
@@ -55,9 +67,31 @@ Plus Extractor 使用浏览器内容脚本在 ChatGPT 页面内提供隔离 UI�
 
 ## 安装
 
-先通过以下任一方式获取扩展文件。
+### 新电脑首次安装需要什么
 
-### 方法一：克隆项目
+仅在浏览器中加载扩展目录还不够。已经验证通过的两阶段代理链路还需要：
+
+- Chrome 或 Edge；
+- Node.js 18 或更高版本，用于运行本地中继；
+- Clash Verge、Mihomo 或兼容客户端；
+- 本机 HTTP 代理监听地址为 `127.0.0.1:7897`；
+- Windows 首次运行一次 `relay/install-relay.ps1`；
+- macOS 首次运行一次 `relay/install-relay.sh`。
+
+网络链路如下：
+
+```text
+浏览器 → 本地中继 127.0.0.1:17897 → Mihomo/Clash 127.0.0.1:7897
+       → 代理供应商网关 → ChatGPT
+```
+
+完成首次配置后，本地中继会随 Windows 登录或 macOS 用户登录自动启动。日常使用时只需启动 Mihomo/Clash、打开浏览器并操作扩展。
+
+### 1. 获取扩展文件
+
+通过以下任一方式获取扩展。
+
+#### 方法一：克隆项目
 
 使用 Git 克隆仓库：
 
@@ -72,14 +106,92 @@ cd plus-extractor
 plus-extractor/chatgpt-checkout-helper
 ```
 
-### 方法二：下载 Release 压缩包
+#### 方法二：下载 ZIP
 
-1. 打开项目的 [Releases 页面](https://github.com/shi-YangYang/plus-extractor/releases)。
-2. 选择所需版本，下载对应的扩展压缩包。
-3. 将压缩包完整解压到一个固定目录；浏览器不能直接加载 ZIP 文件。
-4. 找到解压后包含 `manifest.json` 的目录，后续加载该目录。
+1. 下载 `chatgpt-checkout-helper.zip`。
+2. 将 ZIP 完整解压到固定目录。
+3. 确认解压目录根部包含 `manifest.json`、`background.js`、`content.js` 和 `relay` 目录。
 
-### 加载到 Chrome
+### 2. 安装本机运行环境
+
+#### 安装 Node.js
+
+安装 Node.js 18 或更高版本，然后在 Windows PowerShell 或 macOS Terminal 中确认：
+
+```shell
+node --version
+```
+
+#### 配置 Mihomo/Clash
+
+1. 安装并启动 Clash Verge、Mihomo 或兼容客户端；
+2. 开启系统代理或保证其本地 HTTP 代理处于运行状态；
+3. 确认 HTTP 监听地址为 `127.0.0.1:7897`。
+
+如果客户端使用其他端口，请先将其 HTTP 端口调整为 `7897`，再安装本地中继。
+
+### 3. 安装本地中继（区分操作系统）
+
+#### Windows
+
+在包含 `manifest.json` 的扩展目录打开 PowerShell，然后执行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\relay\install-relay.ps1
+```
+
+成功时会显示以下任一结果：
+
+```text
+RELAY_STARTED
+RELAY_ALREADY_RUNNING
+```
+
+本地中继地址为：
+
+```text
+代理端口：127.0.0.1:17897
+控制端口：127.0.0.1:17898
+```
+
+可以使用以下命令检查中继状态：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:17898/status
+```
+
+返回结果中的 `ready` 应为 `true`。
+
+#### macOS
+
+macOS 可以额外安装 PowerShell 7，但本项目的 Windows `.ps1` 脚本使用了 Windows 启动目录、VBS 和窗口参数。macOS 请使用项目提供的 Bash 脚本和 `launchd`。
+
+在包含 `manifest.json` 的扩展目录打开 Terminal，然后执行：
+
+```bash
+bash ./relay/install-relay.sh
+```
+
+脚本会创建并加载：
+
+```text
+~/Library/LaunchAgents/com.plus-extractor.relay.plist
+```
+
+成功时同样会显示 `RELAY_STARTED` 或 `RELAY_ALREADY_RUNNING`。检查状态：
+
+```bash
+curl -fsS http://127.0.0.1:17898/status
+```
+
+返回 JSON 中的 `ready` 应为 `true`。日志位置：
+
+```text
+~/Library/Logs/PlusExtractorRelay/relay.log
+~/Library/Logs/PlusExtractorRelay/relay-error.log
+```
+
+### 4. 加载到 Chrome
 
 1. 打开以下地址：
 
@@ -91,7 +203,7 @@ plus-extractor/chatgpt-checkout-helper
 3. 点击“加载已解压的扩展程序”。
 4. 选择包含 `manifest.json` 的扩展目录。
 
-### 加载到 Edge
+### 5. 加载到 Edge
 
 1. 打开以下地址：
 
@@ -103,7 +215,14 @@ plus-extractor/chatgpt-checkout-helper
 3. 点击“加载解压缩的扩展”。
 4. 选择包含 `manifest.json` 的扩展目录。
 
-### 更新
+### 6. 首次运行检查
+
+1. 登录并打开 `https://chatgpt.com/`；
+2. 刷新页面，确认右下角出现 Plus 结账入口；
+3. 打开面板并填入 US、TR 两组代理；
+4. 执行流程前确认 Mihomo/Clash 和本地中继均处于运行状态。
+
+### 更新扩展
 
 如果通过 Git 安装，拉取最新代码：
 
@@ -113,7 +232,41 @@ git pull
 
 如果通过 Release 安装，下载新版本压缩包并替换原扩展目录。
 
-更新文件后，在扩展管理页面点击该扩展的“重新加载”按钮，再刷新 ChatGPT 页面。
+更新文件后：
+
+1. Windows 再次运行 `relay/install-relay.ps1`，macOS 再次运行 `bash ./relay/install-relay.sh`；
+2. 在扩展管理页面点击“重新加载”；
+3. 刷新 ChatGPT 页面。
+
+### 停止或卸载本地中继
+
+#### Windows
+
+停止当前中继：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\relay\stop-relay.ps1
+```
+
+移除自动启动项并停止中继：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\relay\uninstall-relay.ps1
+```
+
+#### macOS
+
+停止当前中继：
+
+```bash
+bash ./relay/stop-relay.sh
+```
+
+移除 `launchd` 自动启动项并停止中继：
+
+```bash
+bash ./relay/uninstall-relay.sh
+```
 
 ## 使用
 
@@ -140,6 +293,9 @@ git pull
 ### 结账确认面板
 
 ![Plus Extractor 结账参数确认面板](docs/images/2.png)
+
+### 最终优惠
+![Plus Extractor 最终优惠](docs/images/3.png)
 
 ## 常见问题
 
@@ -169,8 +325,10 @@ git pull
 cd chatgpt-checkout-helper
 node --check core.js
 node --check content.js
-node --test tests/core.test.cjs
+node --test tests\*.test.cjs
 ```
+
+当前测试基线为 41 项。
 
 测试覆盖请求体构造、结账地址编码、响应解析和错误信息格式化。实际支付接口不会在自动测试中调用。
 
