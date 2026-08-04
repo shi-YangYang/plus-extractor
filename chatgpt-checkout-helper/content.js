@@ -6,6 +6,10 @@
   const PROXY_CACHE_KEY = "plusExtractorProxyPoolsV1";
   const PROXY_CACHE_DELAY_MS = 250;
   const core = globalThis.ChatGPTCheckoutCore;
+  const pageHostname = String(window.location && window.location.hostname || "").toLowerCase();
+  const isChatGPTPage = !pageHostname
+    || pageHostname === "chatgpt.com"
+    || pageHostname.endsWith(".chatgpt.com");
 
   if (!core || document.getElementById(ROOT_ID)) {
     return;
@@ -238,6 +242,18 @@
 
     .proxy-state strong { color: #0f766e; }
 
+    .proxy-feedback {
+      border-radius: 8px;
+      font-size: 11px;
+      line-height: 1.5;
+      margin-top: 7px;
+      min-height: 0;
+    }
+
+    .proxy-feedback.error { background: #fef2f2; color: #b91c1c; padding: 7px 9px; }
+    .proxy-feedback.success { background: #ecfdf5; color: #047857; padding: 7px 9px; }
+    .proxy-feedback.warning { background: #fffbeb; color: #a16207; padding: 7px 9px; }
+
     .flow-list {
       color: #475569;
       font-size: 11px;
@@ -463,6 +479,9 @@
 
   const proxyState = element("div", { className: "proxy-state" });
   const proxyStateText = element("span", { text: "当前代理：未由插件接管" });
+  const proxyFeedback = element("div", { className: "proxy-feedback" });
+  proxyFeedback.setAttribute("role", "status");
+  proxyFeedback.setAttribute("aria-live", "polite");
   proxyState.append(proxyStateText);
   proxyToolbox.append(
     proxyGrid,
@@ -470,7 +489,8 @@
       className: "flow-list",
       text: ""
     }),
-    proxyState
+    proxyState,
+    proxyFeedback
   );
   const flowList = proxyToolbox.querySelector(".flow-list");
   flowList.innerHTML = "<li>填写 US 和 TR 两组代理</li><li>插件自动创建并应用优惠</li><li>打开页面后确认今日应付金额为 0</li>";
@@ -580,6 +600,11 @@
   function setStatus(message = "", kind = "") {
     status.textContent = message;
     status.className = kind ? `status ${kind}` : "status";
+  }
+
+  function setProxyFeedback(message = "", kind = "") {
+    proxyFeedback.textContent = message;
+    proxyFeedback.className = kind ? `proxy-feedback ${kind}` : "proxy-feedback";
   }
 
   function renderDiagnostic() {
@@ -739,6 +764,7 @@
       proxyStateText.textContent = "当前代理：未由插件接管";
       resetProxyButton.disabled = true;
       launcher.querySelector(".spark").classList.remove("active");
+      updateSubmitState();
       return;
     }
     const phaseLabel = state.activeProxy.phase === "create" ? "池 1 · 创建阶段" : "池 2 · 优惠阶段";
@@ -746,6 +772,7 @@
     proxyStateText.textContent = `当前代理：${phaseLabel} · ${transportLabel} · ${state.activeProxy.endpoint || "已启用"}`;
     resetProxyButton.disabled = state.busy;
     launcher.querySelector(".spark").classList.add("active");
+    updateSubmitState();
   }
 
   async function refreshProxyState() {
@@ -754,6 +781,7 @@
       renderProxyState(result);
     } catch (error) {
       proxyStateText.textContent = `代理状态读取失败：${error.message}`;
+      updateSubmitState();
     }
   }
 
@@ -775,13 +803,13 @@
   async function clearProxy({ announce = true } = {}) {
     const result = await sendRuntimeMessage({ type: "checkout-helper:clear-proxy" });
     renderProxyState(result);
-    if (announce) setStatus("已清除插件代理并恢复浏览器原有网络设置。", "success");
+    if (announce) setProxyFeedback("已清除插件代理并恢复浏览器原有网络设置。", "success");
     return result;
   }
 
   function updateSubmitState() {
     const { createPool, applyPool } = getProxyPools();
-    manualUsProxyButton.disabled = state.busy || !createPool;
+    manualUsProxyButton.disabled = state.busy || Boolean(state.activeProxy) || !createPool;
     submitButton.disabled = state.busy
       || !state.loggedIn
       || !confirmCheckbox.checked
@@ -807,14 +835,14 @@
 
     const { createPool } = getProxyPools();
     if (!createPool) {
-      setStatus("请先在代理池 1 填写有效的 US 代理。", "error");
+      setProxyFeedback("请先在代理池 1 填写有效的 US 代理。", "error");
       updateSubmitState();
       return;
     }
 
     const proxy = core.selectProxyFromPool(createPool, state.createPoolCursor);
     setBusy(true);
-    setStatus("正在由扩展后台检测切换前出口…");
+    setProxyFeedback("正在由扩展后台检测切换前出口…");
 
     try {
       if (state.activeProxy) await clearProxy({ announce: false });
@@ -828,7 +856,7 @@
         baseline = null;
       }
 
-      setStatus(`正在为当前页面启用 US 代理（${core.formatProxyEndpoint(proxy)}）并检测新出口…`);
+      setProxyFeedback(`正在为整个浏览器启用 US 代理（${core.formatProxyEndpoint(proxy)}）并检测新出口…`);
       const switched = await switchProxy(proxy, "create");
       const exit = switched.connectivity || {};
       if (exit.country && exit.country !== "US") {
@@ -842,17 +870,17 @@
       const location = [exit.country, exit.colo].filter(Boolean).join("/") || "地区未知";
       const unchanged = beforeIp !== "未知" && afterIp !== "未知" && beforeIp === afterIp;
       if (unchanged) {
-        setStatus(`代理设置已启用，但出口 IP 未变化：${afterIp} · ${location}。系统代理与代理池可能共用同一出口。`, "warning");
+        setProxyFeedback(`代理设置已启用，但出口 IP 未变化：${afterIp} · ${location}。系统代理与代理池可能共用同一出口。`, "warning");
       } else {
-        setStatus(`US 代理已启用：${beforeIp} → ${afterIp} · ${location}。`, "success");
+        setProxyFeedback(`US 代理已启用：${beforeIp} → ${afterIp} · ${location}。`, "success");
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       try {
         await clearProxy({ announce: false });
-        setStatus(`${message}；已恢复原代理设置。`, "error");
+        setProxyFeedback(`${message}；已恢复原代理设置。`, "error");
       } catch (restoreError) {
-        setStatus(`${message}；代理恢复失败：${restoreError.message}`, "error");
+        setProxyFeedback(`${message}；代理恢复失败：${restoreError.message}`, "error");
       }
     } finally {
       setBusy(false);
@@ -910,6 +938,11 @@
   async function checkSession() {
     state.loggedIn = false;
     sessionDot.className = "dot";
+    if (!isChatGPTPage) {
+      sessionText.textContent = "代理功能可用；结账提取仅在 ChatGPT 页面启用";
+      updateSubmitState();
+      return;
+    }
     sessionText.textContent = "正在检测登录状态…";
     updateSubmitState();
 
@@ -1397,7 +1430,7 @@
   resetProxyButton.addEventListener("click", () => {
     setBusy(true);
     void clearProxy().catch((error) => {
-      setStatus(`代理恢复失败：${error.message}`, "error");
+      setProxyFeedback(`代理恢复失败：${error.message}`, "error");
     }).finally(() => setBusy(false));
   });
   submitButton.addEventListener("click", () => void createCheckoutSession());

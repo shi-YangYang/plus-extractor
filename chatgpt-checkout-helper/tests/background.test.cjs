@@ -33,6 +33,7 @@ function loadBackgroundHarness() {
   };
   global.chrome = {
     runtime: {
+      id: "checkout-helper-extension-fixture",
       lastError: null,
       onMessage: events.onMessage,
       onInstalled: events.onInstalled
@@ -82,11 +83,16 @@ function loadBackgroundHarness() {
   delete require.cache[require.resolve("../background.js")];
   require("../background.js");
 
-  async function send(message) {
+  async function send(message, senderOverrides = {}) {
     return new Promise((resolve) => {
       const keepChannelOpen = events.onMessage.listener(
         message,
-        { url: "https://chatgpt.com/", tab: { id: 77 } },
+        {
+          id: "checkout-helper-extension-fixture",
+          url: "https://chatgpt.com/",
+          tab: { id: 77 },
+          ...senderOverrides
+        },
         resolve
       );
       assert.equal(keepChannelOpen, true);
@@ -143,6 +149,19 @@ test("background applies, reports and clears a phase proxy", async (t) => {
   const cleared = await harness.send({ type: "checkout-helper:clear-proxy" });
   assert.deepEqual(cleared, { ok: true, active: false });
   assert.equal(harness.proxyState.value.mode, "system");
+});
+
+test("background accepts messages from the extension content script on other websites", async (t) => {
+  const harness = loadBackgroundHarness();
+  t.after(() => harness.restore());
+
+  const status = await harness.send(
+    { type: "checkout-helper:get-proxy-status" },
+    { url: "https://example.com/page" }
+  );
+
+  assert.equal(status.ok, true);
+  assert.equal(status.active, false);
 });
 
 test("background acquires official checkout Sentinel headers in the ChatGPT main world", async (t) => {

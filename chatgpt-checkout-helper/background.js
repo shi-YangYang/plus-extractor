@@ -30,10 +30,13 @@ if (typeof importScripts === "function") {
   }
 
   function assertTrustedSender(sender) {
-    if (!sender || !sender.url) return;
+    if (!sender) throw new Error("消息来源不受信任");
+    if (extensionApi.runtime.id && sender.id !== extensionApi.runtime.id) {
+      throw new Error("消息来源不受信任");
+    }
+    if (!sender.url) return;
     const url = new URL(sender.url);
-    const hostname = url.hostname.toLowerCase();
-    if (hostname !== "chatgpt.com" && !hostname.endsWith(".chatgpt.com")) {
+    if (!["http:", "https:", "file:", "chrome-extension:"].includes(url.protocol)) {
       throw new Error("消息来源不受信任");
     }
   }
