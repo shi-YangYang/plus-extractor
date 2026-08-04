@@ -1294,7 +1294,9 @@
         sessionKind: stripeInitContext && stripeInitContext.stripeCompatible ? "stripe" : "hosted-or-opaque"
       });
 
-      setStatus(`三步链路完成（${checkoutRoute}），正在通过代理池 2 打开带活动字段的支付页…`, "success");
+      setStatus(`三步链路完成（${checkoutRoute}），正在恢复浏览器原代理设置…`);
+      await clearProxy({ announce: false });
+      setStatus("优惠链接已生成，代理已恢复，正在打开支付页…", "success");
       await new Promise((resolve) => setTimeout(resolve, 220));
       window.location.assign(checkoutUrl);
     } catch (error) {
