@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Checkout Helper UI Harness</title>
+    <style>
+      body {
+        background: #f7f7f8;
+        color: #202123;
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        min-height: 100vh;
+      }
+
+      main {
+        margin: 0 auto;
+        max-width: 900px;
+        padding: 72px 24px;
+      }
+
+      .test-banner {
+        background: #e0f2fe;
+        border: 1px solid #7dd3fc;
+        border-radius: 12px;
+        color: #075985;
+        padding: 14px 16px;
+      }
+    </style>
+    <script>
+      const originalFetch = window.fetch.bind(window);
+
+      window.fetch = async (input, options = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
+
+        if (url.pathname === "/api/auth/session") {
+          return new Response(JSON.stringify({ accessToken: "TEST_ACCESS_TOKEN" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        if (url.pathname === "/backend-api/payments/checkout") {
+          return new Response(JSON.stringify({
+            code: "promo_not_eligible",
+            detail: "Not eligible for this campaign in the current region"
+          }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        return originalFetch(input, options);
+      };
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>Plus Extractor UI 测试页</h1>
+      <p class="test-banner">所有会话和结账响应均为本地模拟，不会访问真实支付接口。</p>
+    </main>
+    <script src="../core.js"></script>
+    <script src="../content.js"></script>
+  </body>
+</html>

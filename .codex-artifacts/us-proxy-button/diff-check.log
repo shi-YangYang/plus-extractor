@@ -1,0 +1,7 @@
+﻿DIFF_CHECK_OUTPUT_BEGIN
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'chatgpt-checkout-helper/content.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'chatgpt-checkout-helper/manifest.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'chatgpt-checkout-helper/tests/content.test.cjs', LF will be replaced by CRLF the next time Git touches it
+DIFF_CHECK_OUTPUT_END
+DIFF_CHECK_EXIT=0

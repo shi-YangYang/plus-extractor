@@ -307,8 +307,9 @@
 
     .status.error { background: #fef2f2; color: #b91c1c; padding: 9px 10px; }
     .status.success { background: #ecfdf5; color: #047857; padding: 9px 10px; }
+    .status.warning { background: #fffbeb; color: #a16207; padding: 9px 10px; }
 
-    .actions { display: flex; gap: 10px; justify-content: flex-end; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
 
     .button {
       border: 0;
@@ -546,13 +547,19 @@
     type: "button",
     text: "恢复代理"
   });
+  const manualUsProxyButton = element("button", {
+    className: "button secondary",
+    type: "button",
+    text: "整个浏览器使用 US 代理"
+  });
+  manualUsProxyButton.disabled = true;
   const submitButton = element("button", {
     className: "button primary",
     type: "button",
     text: "开始提取"
   });
   submitButton.disabled = true;
-  actions.append(resetProxyButton, closeButton, submitButton);
+  actions.append(manualUsProxyButton, resetProxyButton, closeButton, submitButton);
 
   panel.append(
     header,
@@ -762,7 +769,7 @@
     if (!connectivity.reachable) {
       throw new Error("代理连通性检查未通过");
     }
-    return result;
+    return { ...result, connectivity };
   }
 
   async function clearProxy({ announce = true } = {}) {
@@ -774,6 +781,7 @@
 
   function updateSubmitState() {
     const { createPool, applyPool } = getProxyPools();
+    manualUsProxyButton.disabled = state.busy || !createPool;
     submitButton.disabled = state.busy
       || !state.loggedIn
       || !confirmCheckbox.checked
@@ -792,6 +800,63 @@
     resetProxyButton.disabled = busy || !state.activeProxy;
     submitButton.textContent = busy ? "正在处理…" : "开始提取";
     updateSubmitState();
+  }
+
+  async function useUsProxyForBrowser() {
+    if (state.busy) return;
+
+    const { createPool } = getProxyPools();
+    if (!createPool) {
+      setStatus("请先在代理池 1 填写有效的 US 代理。", "error");
+      updateSubmitState();
+      return;
+    }
+
+    const proxy = core.selectProxyFromPool(createPool, state.createPoolCursor);
+    setBusy(true);
+    setStatus("正在由扩展后台检测切换前出口…");
+
+    try {
+      if (state.activeProxy) await clearProxy({ announce: false });
+      let baseline = null;
+      try {
+        baseline = await sendRuntimeMessage({
+          type: "checkout-helper:trace-exit",
+          probe: "baseline"
+        });
+      } catch {
+        baseline = null;
+      }
+
+      setStatus(`正在为当前页面启用 US 代理（${core.formatProxyEndpoint(proxy)}）并检测新出口…`);
+      const switched = await switchProxy(proxy, "create");
+      const exit = switched.connectivity || {};
+      if (exit.country && exit.country !== "US") {
+        throw new Error(`代理出口地区为 ${exit.country}，不是 US`);
+      }
+
+      state.createPoolCursor += 1;
+      recordDiagnostic(core.createDiagnosticRecord({ stage: "proxy_create", status: 200, ok: true }));
+      const beforeIp = baseline && baseline.exitIp ? baseline.exitIp : "未知";
+      const afterIp = exit.exitIp || "未知";
+      const location = [exit.country, exit.colo].filter(Boolean).join("/") || "地区未知";
+      const unchanged = beforeIp !== "未知" && afterIp !== "未知" && beforeIp === afterIp;
+      if (unchanged) {
+        setStatus(`代理设置已启用，但出口 IP 未变化：${afterIp} · ${location}。系统代理与代理池可能共用同一出口。`, "warning");
+      } else {
+        setStatus(`US 代理已启用：${beforeIp} → ${afterIp} · ${location}。`, "success");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        await clearProxy({ announce: false });
+        setStatus(`${message}；已恢复原代理设置。`, "error");
+      } catch (restoreError) {
+        setStatus(`${message}；代理恢复失败：${restoreError.message}`, "error");
+      }
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function fetchJson(url, options = {}, stage = "network") {
@@ -1328,6 +1393,7 @@
   });
   diagnosticCheckbox.addEventListener("change", renderDiagnostic);
   openOfficialLinkButton.addEventListener("click", openOfficialActivityLink);
+  manualUsProxyButton.addEventListener("click", () => void useUsProxyForBrowser());
   resetProxyButton.addEventListener("click", () => {
     setBusy(true);
     void clearProxy().catch((error) => {

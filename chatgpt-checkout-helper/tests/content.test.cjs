@@ -128,8 +128,109 @@ test("content script mounts the two proxy pools and keeps submit disabled initia
 
   const submit = collect(host.shadowRoot, (node) => node.tagName === "BUTTON")
     .find((node) => node.textContent === "开始提取");
+  const manualUsProxy = collect(host.shadowRoot, (node) => node.tagName === "BUTTON")
+    .find((node) => node.textContent === "整个浏览器使用 US 代理");
   assert.ok(submit);
+  assert.ok(manualUsProxy);
+  assert.equal(manualUsProxy.disabled, true);
   assert.equal(submit.disabled, true);
+});
+
+test("content script manually applies a US proxy from pool 1 to the regular browser profile", async (t) => {
+  const html = new FakeNode("html");
+  const runtimeMessages = [];
+  const nativeSetTimeout = global.setTimeout;
+
+  global.ChatGPTCheckoutCore = require("../core.js");
+  global.document = {
+    documentElement: html,
+    createElement: (tagName) => new FakeNode(tagName),
+    getElementById: () => null,
+    addEventListener: () => undefined
+  };
+  global.window = {
+    open: () => undefined,
+    location: { assign: () => undefined }
+  };
+  global.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage(message, callback) {
+        runtimeMessages.push(message);
+        if (message.type === "checkout-helper:set-proxy") {
+          const proxy = global.ChatGPTCheckoutCore.parseProxyLine(message.proxy);
+          callback({
+            ok: true,
+            active: true,
+            phase: message.phase,
+            endpoint: global.ChatGPTCheckoutCore.formatProxyEndpoint(proxy),
+            transport: "direct"
+          });
+          return;
+        }
+        if (message.type === "checkout-helper:trace-exit") {
+          callback({
+            ok: true,
+            probe: "baseline",
+            exitIp: "198.51.100.10",
+            country: "CN",
+            colo: "HKG"
+          });
+          return;
+        }
+        if (message.type === "checkout-helper:test-proxy") {
+          callback({
+            ok: true,
+            reachable: true,
+            active: true,
+            exitIp: "203.0.113.20",
+            country: "US",
+            colo: "SJC"
+          });
+          return;
+        }
+        callback({ ok: true, active: false });
+      }
+    }
+  };
+  global.setTimeout = (callback, delay, ...args) => (
+    delay < 1000 ? nativeSetTimeout(callback, 0, ...args) : nativeSetTimeout(callback, delay, ...args)
+  );
+
+  t.after(() => {
+    global.setTimeout = nativeSetTimeout;
+    delete global.document;
+    delete global.window;
+    delete global.chrome;
+    delete global.ChatGPTCheckoutCore;
+  });
+
+  delete require.cache[require.resolve("../content.js")];
+  require("../content.js");
+
+  const nodes = collect(html.children[0].shadowRoot, () => true);
+  const createProxyInput = nodes.find((node) => node.id === "checkout-helper-proxy-create");
+  const manualUsProxy = nodes.find((node) => node.tagName === "BUTTON" && node.textContent === "整个浏览器使用 US 代理");
+  const status = nodes.find((node) => node.className === "status");
+
+  createProxyInput.value = "us-user:us-pass@us.example:1000";
+  createProxyInput.listeners.input();
+  assert.equal(manualUsProxy.disabled, false);
+
+  manualUsProxy.listeners.click();
+  for (let index = 0; index < 10 && !status.textContent.includes("US 代理已启用"); index += 1) {
+    await new Promise((resolve) => nativeSetTimeout(resolve, 5));
+  }
+
+  assert.deepEqual(
+    runtimeMessages
+      .filter((message) => ["checkout-helper:trace-exit", "checkout-helper:set-proxy", "checkout-helper:test-proxy"].includes(message.type))
+      .map((message) => message.type === "checkout-helper:set-proxy" ? `set:${message.phase}` : message.type),
+    ["checkout-helper:trace-exit", "set:create", "checkout-helper:test-proxy"]
+  );
+  assert.equal(runtimeMessages.find((message) => message.type === "checkout-helper:set-proxy").proxy, "us-user:us-pass@us.example:1000");
+  assert.match(status.textContent, /US 代理已启用/);
+  assert.match(status.textContent, /198\.51\.100\.10 → 203\.0\.113\.20/);
 });
 
 test("content script creates a US baseline, applies the promotion through TR, and opens only oaics", async (t) => {
