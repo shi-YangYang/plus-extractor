@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Plus Extractor · Local Control</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LOCAL CONTROL PLANE</p>
+          <h1>Plus Extractor</h1>
+          <p class="subtitle">本地代理池、账号流水线与适配器状态中心</p>
+        </div>
+        <div class="health" id="health" data-state="loading">
+          <span class="health-dot" aria-hidden="true"></span>
+          <span id="health-text">正在连接 Local API</span>
+        </div>
+      </header>
+
+      <aside class="deprecation" role="note">
+        <span class="deprecation-icon">!</span>
+        <div>
+          <strong>浏览器插件已弃用</strong>
+          <p>旧插件仅保留为自动提链参考实现；后续注册、提链、绑卡和试用资格流程统一进入本地 Web UI。</p>
+        </div>
+      </aside>
+
+      <main>
+        <section class="panel" aria-labelledby="proxy-heading">
+          <div class="panel-heading">
+            <div>
+              <p class="section-index">01 · NETWORK</p>
+              <h2 id="proxy-heading">代理池配置</h2>
+              <p>凭据仅写入本地后端；页面和 API 响应只展示脱敏端点。</p>
+            </div>
+            <button class="button ghost" id="refresh-button" type="button">刷新状态</button>
+          </div>
+
+          <form id="proxy-form">
+            <div class="proxy-grid">
+              <article class="proxy-card" data-region="US">
+                <div class="proxy-title-row">
+                  <div>
+                    <span class="region-pill us">US</span>
+                    <h3>主流程代理池</h3>
+                  </div>
+                  <span class="count" id="us-count">未配置</span>
+                </div>
+                <p class="proxy-purpose">注册 ChatGPT、提链创建阶段、绑卡与支付接口。</p>
+                <textarea id="us-pool" name="US" spellcheck="false" autocomplete="off" placeholder="USER:PASSWORD@HOST:PORT&#10;每行一条"></textarea>
+                <div class="card-actions">
+                  <button class="button subtle probe-button" data-region="US" type="button">测试第一个网关</button>
+                  <span class="probe-result" id="us-probe"></span>
+                </div>
+                <div class="endpoint-list" id="us-endpoints"></div>
+              </article>
+
+              <article class="proxy-card" data-region="TR">
+                <div class="proxy-title-row">
+                  <div>
+                    <span class="region-pill tr">TR</span>
+                    <h3>提链第二阶段代理池</h3>
+                  </div>
+                  <span class="count" id="tr-count">未配置</span>
+                </div>
+                <p class="proxy-purpose">用于既有 US → TR 自动提链流程的第二阶段。</p>
+                <textarea id="tr-pool" name="TR" spellcheck="false" autocomplete="off" placeholder="USER:PASSWORD@HOST:PORT&#10;每行一条"></textarea>
+                <div class="card-actions">
+                  <button class="button subtle probe-button" data-region="TR" type="button">测试第一个网关</button>
+                  <span class="probe-result" id="tr-probe"></span>
+                </div>
+                <div class="endpoint-list" id="tr-endpoints"></div>
+              </article>
+            </div>
+            <div class="form-footer">
+              <p class="form-message" id="proxy-message" role="status" aria-live="polite"></p>
+              <button class="button primary" type="submit">保存并替换代理池</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" aria-labelledby="pipeline-heading">
+          <div class="panel-heading">
+            <div>
+              <p class="section-index">02 · PIPELINE</p>
+              <h2 id="pipeline-heading">最终业务链路</h2>
+              <p>每个阶段独立记录状态，失败后从当前阶段恢复。</p>
+            </div>
+          </div>
+          <div class="pipeline" id="pipeline"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="task-heading">
+          <div class="panel-heading">
+            <div>
+              <p class="section-index">03 · TASKS</p>
+              <h2 id="task-heading">账号任务</h2>
+              <p>注册阶段使用 US 代理调用认证协议接口，轮询验证码、自动生成资料并保存本地登录会话；不操作页面表单。</p>
+            </div>
+          </div>
+          <form class="registration-form" id="registration-form">
+            <label class="field-label account-field" for="account-source">
+              <span>iCloud 邮箱与接码地址</span>
+              <input
+                id="account-source"
+                name="accountSource"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="icloud邮箱----https://接码平台/messages/..."
+              >
+            </label>
+            <p class="generated-profile-note">账户姓名将自动生成为 <code>First Last</code>，年龄随机为 20–40 岁；协议会识别资料页的 <code>age</code> / <code>birthday</code> 变体并提交对应资料。</p>
+            <div class="registration-actions">
+              <button class="button subtle" id="mailbox-probe-button" type="button">测试接码读取</button>
+              <button class="button primary" id="create-task-button" type="submit">创建流水线任务</button>
+            </div>
+            <p class="form-message" id="registration-message" role="status" aria-live="polite"></p>
+          </form>
+          <section class="account-export-bar" aria-labelledby="account-export-heading">
+            <div class="account-export-copy">
+              <p class="section-index">ACCOUNT EXPORT</p>
+              <h3 id="account-export-heading">批量导出账号</h3>
+              <p id="account-export-count">已选择 0 个账号</p>
+            </div>
+            <label class="export-select-all">
+              <input id="export-select-all" type="checkbox">
+              <span>全选</span>
+            </label>
+            <label class="field-label export-format" for="export-format">
+              <span>导出格式</span>
+              <select id="export-format">
+                <option value="email_url">邮箱---URL</option>
+                <option value="access_token">Access Token</option>
+              </select>
+            </label>
+            <button class="button primary" id="export-accounts-button" type="button" disabled>导出所选账号</button>
+            <p class="form-message account-export-message" id="account-export-message" role="status" aria-live="polite"></p>
+          </section>
+          <div class="task-layout">
+            <div class="task-list" id="task-list">
+              <div class="empty-state">尚无任务</div>
+            </div>
+            <aside class="task-detail" id="task-detail">
+              <div class="empty-state">选择任务查看阶段日志</div>
+            </aside>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <span>Local API: <code id="api-address">http://127.0.0.1:17890</code></span>
+        <span>所有服务仅监听本机回环地址</span>
+      </footer>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

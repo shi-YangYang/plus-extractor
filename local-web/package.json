@@ -1,0 +1,16 @@
+{
+  "name": "plus-extractor-local-web",
+  "private": true,
+  "description": "Local Web UI and Local API for the Plus Extractor workflow.",
+  "scripts": {
+    "start": "node scripts/dev.js",
+    "start:backend": "node server/index.js",
+    "start:frontend": "node scripts/serve-web.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright-core": "1.62.0"
+  }
+}

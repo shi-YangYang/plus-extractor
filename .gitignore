@@ -1,3 +1,35 @@
 .codex-artifacts/
+.codex-memory/
+local-web/data/
+local-web/logs/
+local-web/.env
+**/node_modules/
 test-results/
 **/.test-output/
+
+# Build outputs
+**/dist/
+**/build/
+**/out/
+**/coverage/
+**/.next/
+**/.nuxt/
+**/.svelte-kit/
+**/.vite/
+**/.turbo/
+**/*.tsbuildinfo
+
+# Tool and runtime caches
+**/.cache/
+**/.parcel-cache/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/__pycache__/
+**/*.py[cod]
+**/.eslintcache
+**/.stylelintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

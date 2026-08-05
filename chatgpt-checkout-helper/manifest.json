@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Plus Extractor - Two-stage Proxy Flow",
+  "name": "[Deprecated] Plus Extractor - Two-stage Proxy Flow",
   "version": "0.2.4",
-  "description": "Verified US-to-TR PH_SHORT flow with hard CONNECT tunnel reset before applying the 100% Plus campaign.",
+  "description": "Deprecated reference implementation. New development has moved to the local Web UI and Local API.",
   "minimum_chrome_version": "102",
   "permissions": [
     "proxy",
