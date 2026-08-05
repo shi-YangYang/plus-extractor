@@ -185,6 +185,7 @@ textarea::placeholder { color: #536d64; }
   font-size: 11px;
 }
 .field-label input::placeholder { color: #536d64; }
+.account-field textarea { min-height: 116px; }
 .account-field { grid-column: 1 / -1; }
 .generated-profile-note { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
 .generated-profile-note code { color: var(--green); }
@@ -198,6 +199,11 @@ textarea::placeholder { color: #536d64; }
 .export-select-all input, .task-export-checkbox { accent-color: var(--green); }
 .export-format select { min-width: 170px; border: 1px solid var(--border); border-radius: 10px; background: rgba(2, 12, 9, 0.82); color: var(--text); padding: 9px 11px; }
 .account-export-message { grid-column: 1 / -1; min-height: 16px; }
+.batch-run-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.batch-retry-control { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; border: 1px solid var(--border); border-radius: 10px; background: rgba(2, 12, 9, 0.55); padding: 0 8px 0 11px; color: var(--muted); font-size: 10px; font-weight: 800; }
+.batch-retry-control input { width: 58px; border: 0; border-left: 1px solid var(--border); background: transparent; color: var(--text); padding: 7px 4px 7px 10px; text-align: center; }
+.batch-limit-note { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.account-batch-message { grid-column: 1 / -1; min-height: 16px; }
 
 .pipeline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .stage { position: relative; min-height: 146px; border: 1px solid var(--border); border-radius: 14px; background: rgba(3, 16, 12, 0.38); padding: 14px; }

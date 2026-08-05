@@ -136,7 +136,9 @@ async function createApplication(options = {}) {
     adapters,
     profileAddressGenerator,
     sessionDirectory: path.join(dataDirectory, "sessions"),
-    accountExportClient
+    accountExportClient,
+    sleep: options.taskSleep,
+    batchRetryDelayMs: options.batchRetryDelayMs
   });
   await tasks.init();
 
@@ -167,6 +169,7 @@ async function createApplication(options = {}) {
           pipeline: tasks.pipeline(),
           adapters: tasks.adapterStatus(),
           accountExport: { formats: ["email_url", "access_token"], maxBatchSize: 500 },
+          batch: tasks.batchConfiguration(),
           tasks: tasks.list()
         });
         return;
@@ -206,6 +209,18 @@ async function createApplication(options = {}) {
       if (request.method === "POST" && url.pathname === "/api/tasks") {
         const body = await readJson(request);
         sendJson(response, 201, { ok: true, task: await tasks.create(body) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/tasks/import") {
+        const body = await readJson(request);
+        sendJson(response, 201, { ok: true, import: await tasks.importAccounts(body) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/tasks/batch/run") {
+        const body = await readJson(request);
+        sendJson(response, 200, { ok: true, batch: await tasks.runBatch(body) });
         return;
       }
 

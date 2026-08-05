@@ -104,27 +104,27 @@
           </div>
           <form class="registration-form" id="registration-form">
             <label class="field-label account-field" for="account-source">
-              <span>iCloud 邮箱与接码地址</span>
-              <input
+              <span>批量导入账号（每行一个，自动识别三条或四条连接线）</span>
+              <textarea
                 id="account-source"
                 name="accountSource"
-                type="text"
+                rows="6"
                 autocomplete="off"
                 spellcheck="false"
-                placeholder="icloud邮箱----https://接码平台/messages/..."
-              >
+                placeholder="icloud邮箱---https://接码平台/messages/...&#10;icloud邮箱----https://接码平台/messages/..."
+              ></textarea>
             </label>
             <p class="generated-profile-note">账户姓名将自动生成为 <code>First Last</code>，年龄随机为 20–40 岁；协议会识别资料页的 <code>age</code> / <code>birthday</code> 变体并提交对应资料。</p>
             <div class="registration-actions">
               <button class="button subtle" id="mailbox-probe-button" type="button">测试接码读取</button>
-              <button class="button primary" id="create-task-button" type="submit">创建流水线任务</button>
+              <button class="button primary" id="create-task-button" type="submit">批量导入任务</button>
             </div>
             <p class="form-message" id="registration-message" role="status" aria-live="polite"></p>
           </form>
           <section class="account-export-bar" aria-labelledby="account-export-heading">
             <div class="account-export-copy">
               <p class="section-index">ACCOUNT EXPORT</p>
-              <h3 id="account-export-heading">批量导出账号</h3>
+              <h3 id="account-export-heading">批量账号操作</h3>
               <p id="account-export-count">已选择 0 个账号</p>
             </div>
             <label class="export-select-all">
@@ -139,6 +139,18 @@
               </select>
             </label>
             <button class="button primary" id="export-accounts-button" type="button" disabled>导出所选账号</button>
+            <div class="batch-run-actions" aria-label="批量并发操作">
+              <button class="button subtle warning" id="select-failed-button" type="button" disabled>一键选择失败</button>
+              <label class="batch-retry-control" for="batch-retry-count">
+                <span>自动重试次数</span>
+                <input id="batch-retry-count" type="number" min="0" max="10" step="1" value="2" inputmode="numeric">
+              </label>
+              <button class="button subtle" id="batch-register-button" type="button" disabled>并发注册</button>
+              <button class="button subtle" id="batch-extract-button" type="button" disabled>并发提链</button>
+              <button class="button primary" id="batch-subscribe-button" type="button" disabled>同步订阅</button>
+            </div>
+            <p class="batch-limit-note">并发操作每批最多 10 个；自动重试仅重跑注册/提链失败账号，每轮等待节点切换；同步订阅仍保持单次屏障放行。</p>
+            <p class="form-message account-batch-message" id="account-batch-message" role="status" aria-live="polite"></p>
             <p class="form-message account-export-message" id="account-export-message" role="status" aria-live="polite"></p>
           </section>
           <div class="task-layout">

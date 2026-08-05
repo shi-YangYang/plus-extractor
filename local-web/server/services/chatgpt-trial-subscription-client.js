@@ -18,6 +18,7 @@ const CHECKOUT_SNAPSHOT_ENDPOINT = "/backend-api/payments/checkout/snapshot";
 const CHECKOUT_CONFIRM_ENDPOINT = "/backend-api/payments/checkout/confirm";
 const ACCOUNT_CONTEXT_ENDPOINT = "/backend-api/accounts/check/v4-2023-04-27";
 const CHECKOUT_APPROVAL_FLOW = "checkout_session_approval";
+const PREPARED_SUBSCRIPTION = Symbol("prepared-subscription");
 
 function extractCheckoutReference(checkoutUrl) {
   let parsed;
@@ -251,8 +252,9 @@ class ChatGptTrialSubscriptionClient {
     });
   }
 
-  async postConfirm(runtime, authenticated, accountId, body) {
-    const sentinelHeaders = await runtime.acquireSentinelHeaders(CHECKOUT_APPROVAL_FLOW);
+  async postConfirm(runtime, authenticated, accountId, body, preparedSentinelHeaders = null) {
+    const sentinelHeaders = preparedSentinelHeaders
+      || await runtime.acquireSentinelHeaders(CHECKOUT_APPROVAL_FLOW);
     return runtime.requestJson(CHECKOUT_CONFIRM_ENDPOINT, {
       method: "POST",
       headers: accountHeaders(authenticated.accessToken, accountId, CHECKOUT_CONFIRM_ENDPOINT, {
@@ -291,7 +293,17 @@ class ChatGptTrialSubscriptionClient {
     return Object.freeze({ ...uiObservation, screenshotPath });
   }
 
-  async subscribe({
+  assertPrepared(prepared) {
+    if (!prepared || prepared[PREPARED_SUBSCRIPTION] !== this) {
+      throw new AppError(409, "TRIAL_SUBSCRIPTION_PREPARATION_INVALID", "The prepared subscription handle is invalid.");
+    }
+    if (prepared.closed) {
+      throw new AppError(409, "TRIAL_SUBSCRIPTION_PREPARATION_CLOSED", "The prepared subscription handle is already closed.");
+    }
+    return prepared;
+  }
+
+  async prepare({
     taskId,
     accountSession,
     checkoutUrl,
@@ -314,7 +326,7 @@ class ChatGptTrialSubscriptionClient {
     const runtime = this.runtimeFactory();
     let verifiedCheckout = null;
     try {
-      await reportProgress("正在通过 US 代理恢复账号会话并核验出口");
+      await reportProgress("Restoring the account session through the US proxy and verifying the exit.");
       await runtime.open({ accountSession: session, proxy: stickyProxy });
       await runtime.verifyExit("US");
       const authenticated = await runtime.readSession();
@@ -323,9 +335,19 @@ class ChatGptTrialSubscriptionClient {
       try {
         const existing = await this.readEntitlement(runtime, authenticated, accountId);
         if (existing.active) {
-          await reportProgress("账号已存在有效 Plus 订阅，已直接恢复成功状态");
+          await reportProgress("An active Plus subscription already exists; restoring the successful state.");
           if (typeof runtime.saveSession === "function") await runtime.saveSession(session.path);
-          return this.buildResult({ entitlement: existing, checkout: null, promotionId: "", recovered: true });
+          return {
+            [PREPARED_SUBSCRIPTION]: this,
+            runtime,
+            taskId,
+            session,
+            reportProgress,
+            recoveredResult: this.buildResult({ entitlement: existing, checkout: null, promotionId: "", recovered: true }),
+            requiresConfirmation: false,
+            armed: true,
+            closed: false
+          };
         }
       } catch (error) {
         if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
@@ -336,7 +358,7 @@ class ChatGptTrialSubscriptionClient {
       const initialPayload = await this.readCheckout(runtime, authenticated, accountId, reference);
       const initial = summarizeCheckout(initialPayload);
       assertTrialCheckout(initial, { manualApprovalConfirmed: confirmed === true });
-      await reportProgress("活动 Checkout 与默认卡已确认，正在写入 US 账单快照", {
+      await reportProgress("The promoted Checkout and default card are confirmed; writing the US billing snapshot.", {
         promotionId: initial.promotionId
       });
 
@@ -371,7 +393,7 @@ class ChatGptTrialSubscriptionClient {
         }
       }
       if (!verifiedCheckout) throw lastBillingError || new AppError(409, "TRIAL_BILLING_NOT_UPDATED", "US billing verification did not complete.");
-      await reportProgress("US 账单快照已由官方接口接受并复核：税额与税率均为 0");
+      await reportProgress("The US billing snapshot was accepted and verified with zero tax.");
 
       await runtime.navigateCheckout(reference.url);
       let paymentElementError = null;
@@ -379,7 +401,7 @@ class ChatGptTrialSubscriptionClient {
       for (let attempt = 0; attempt < this.paymentElementAttempts; attempt += 1) {
         try {
           if (attempt > 0) {
-            await reportProgress(`结账资源仍在加载，继续等待 ${Math.ceil(this.paymentElementRefreshDelayMs / 1_000)} 秒后刷新提链页面（${attempt + 1}/${this.paymentElementAttempts}）`);
+            await reportProgress(`Checkout resources are still loading; wait ${Math.ceil(this.paymentElementRefreshDelayMs / 1_000)} seconds and refresh only the extracted page (${attempt + 1}/${this.paymentElementAttempts}).`);
             if (this.paymentElementRefreshDelayMs) await this.sleep(this.paymentElementRefreshDelayMs);
             if (typeof runtime.refreshCheckout === "function") await runtime.refreshCheckout(reference.url);
             else await runtime.navigateCheckout(reference.url);
@@ -401,13 +423,62 @@ class ChatGptTrialSubscriptionClient {
       }
       if (paymentElementError) throw paymentElementError;
       if (!confirmation) throw new AppError(502, "CHECKOUT_CONFIRMATION_TOKEN_FAILED", "Stripe confirmation token was not created.");
-      await reportProgress("Stripe 已使用默认卡生成一次性确认令牌，正在提交订阅接口");
+      await reportProgress("The Stripe confirmation token is ready; Checkout is fully loaded at the batch barrier.");
 
+      return {
+        [PREPARED_SUBSCRIPTION]: this,
+        runtime,
+        taskId,
+        session,
+        authenticated,
+        accountId,
+        reference,
+        verifiedCheckout,
+        confirmation,
+        reportProgress,
+        recoveredResult: null,
+        requiresConfirmation: true,
+        sentinelHeaders: null,
+        armed: false,
+        closed: false
+      };
+    } catch (error) {
+      await runtime.close().catch(() => {});
+      if (error instanceof AppError) throw error;
+      throw new AppError(502, "TRIAL_SUBSCRIPTION_FAILED", error && error.message || "Trial subscription failed.");
+    }
+  }
+
+  async armPrepared(prepared) {
+    const handle = this.assertPrepared(prepared);
+    if (!handle.requiresConfirmation || handle.armed) return handle;
+    handle.sentinelHeaders = await handle.runtime.acquireSentinelHeaders(CHECKOUT_APPROVAL_FLOW);
+    handle.armed = true;
+    await handle.reportProgress("The Sentinel approval headers are armed and waiting for synchronized confirm release.");
+    return handle;
+  }
+
+  async confirmPrepared(prepared) {
+    const handle = this.assertPrepared(prepared);
+    if (handle.recoveredResult) return { recoveredResult: handle.recoveredResult };
+    if (!handle.armed || !handle.sentinelHeaders) {
+      throw new AppError(409, "TRIAL_SUBSCRIPTION_NOT_ARMED", "The prepared subscription is not armed for synchronized confirmation.");
+    }
+    const {
+      runtime,
+      authenticated,
+      accountId,
+      reference,
+      confirmation,
+      taskId,
+      reportProgress
+    } = handle;
+    try {
       let confirmedCheckout = await this.postConfirm(runtime, authenticated, accountId, {
         checkout_session_id: reference.checkoutSessionId,
         confirm_token: confirmation.token,
         selected_payment_method_type: confirmation.selectedPaymentMethodType
-      });
+      }, handle.sentinelHeaders);
       if (confirmFailure(confirmedCheckout)) {
         const uiObservation = await this.observeRejectedCheckout(runtime, taskId, reportProgress);
         throw new AppError(
@@ -438,7 +509,32 @@ class ChatGptTrialSubscriptionClient {
           );
         }
       }
+      return { confirmedCheckout };
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw new AppError(502, "TRIAL_SUBSCRIPTION_CONFIRM_FAILED", error && error.message || "Trial subscription confirmation failed.");
+    }
+  }
 
+  async verifyPrepared(prepared, confirmationResult = {}) {
+    const handle = this.assertPrepared(prepared);
+    if (confirmationResult.recoveredResult || handle.recoveredResult) {
+      return confirmationResult.recoveredResult || handle.recoveredResult;
+    }
+    const {
+      runtime,
+      authenticated,
+      accountId,
+      session,
+      confirmation,
+      verifiedCheckout,
+      reportProgress
+    } = handle;
+    const confirmedCheckout = confirmationResult.confirmedCheckout;
+    if (!confirmedCheckout) {
+      throw new AppError(502, "TRIAL_SUBSCRIPTION_CONFIRM_RESULT_MISSING", "The synchronized confirmation did not return a checkout result.");
+    }
+    try {
       const confirmationSecret = clientSecretFrom(confirmedCheckout);
       if (confirmationSecret) {
         await runtime.confirmStripeIntent({
@@ -449,7 +545,7 @@ class ChatGptTrialSubscriptionClient {
       }
       if (typeof runtime.saveSession === "function") await runtime.saveSession(session.path);
 
-      await reportProgress("订阅确认已提交，正在轮询账号 Plus entitlement");
+      await reportProgress("The subscription confirmation was submitted; polling Plus entitlement.");
       let entitlement = null;
       for (let attempt = 0; attempt < this.entitlementAttempts; attempt += 1) {
         if (attempt > 0 && this.pollDelayMs) await this.sleep(this.pollDelayMs);
@@ -459,7 +555,7 @@ class ChatGptTrialSubscriptionClient {
       if (!entitlement || !entitlement.active) {
         throw new AppError(409, "TRIAL_SUBSCRIPTION_NOT_VERIFIED", "The confirmation completed, but the Plus entitlement is not active yet.");
       }
-      await reportProgress("Plus entitlement 已激活，一键订阅完成");
+      await reportProgress("Plus entitlement is active; subscription is complete.");
       return this.buildResult({
         entitlement,
         checkout: verifiedCheckout,
@@ -468,8 +564,24 @@ class ChatGptTrialSubscriptionClient {
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError(502, "TRIAL_SUBSCRIPTION_FAILED", error && error.message || "Trial subscription failed.");
+    }
+  }
+
+  async closePrepared(prepared) {
+    if (!prepared || prepared[PREPARED_SUBSCRIPTION] !== this || prepared.closed) return;
+    prepared.closed = true;
+    await prepared.runtime.close().catch(() => {});
+  }
+
+  async subscribe(input = {}) {
+    let prepared = null;
+    try {
+      prepared = await this.prepare(input);
+      await this.armPrepared(prepared);
+      const confirmation = await this.confirmPrepared(prepared);
+      return await this.verifyPrepared(prepared, confirmation);
     } finally {
-      await runtime.close().catch(() => {});
+      await this.closePrepared(prepared);
     }
   }
 }

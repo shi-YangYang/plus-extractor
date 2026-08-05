@@ -41,13 +41,13 @@ function maskEmail(email) {
 
 function parseAccountLine(value) {
   const line = String(value || "").trim();
-  const separator = line.indexOf("----");
-  if (separator < 1) {
-    throw new AppError(400, "INVALID_ACCOUNT_SOURCE", "Account source must use: iCloud email----mailbox URL");
+  const match = line.match(/^(\S+@icloud\.com)\s*-{3,}\s*(https:\/\/.+)$/i);
+  if (!match) {
+    throw new AppError(400, "INVALID_ACCOUNT_SOURCE", "Account source must use one line per account: iCloud email---mailbox URL");
   }
   return {
-    email: line.slice(0, separator).trim(),
-    inboxUrl: line.slice(separator + 4).trim()
+    email: match[1].trim(),
+    inboxUrl: match[2].trim()
   };
 }
 

@@ -1,11 +1,29 @@
 "use strict";
 
 const API_BASE = localStorage.getItem("plusExtractorApiBase") || "http://127.0.0.1:17890";
+const FAILURE_SELECTION_GROUPS = Object.freeze([
+  Object.freeze({
+    stage: "registration",
+    label: "注册失败",
+    states: Object.freeze(["REGISTERING_BLOCKED", "REGISTRATION_BLOCKED", "REGISTRATION_FAILED"])
+  }),
+  Object.freeze({
+    stage: "checkout_link",
+    label: "提链失败",
+    states: Object.freeze(["CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED"])
+  }),
+  Object.freeze({
+    stage: "trial_payment",
+    label: "订阅失败",
+    states: Object.freeze(["TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"])
+  })
+]);
 const state = {
   bootstrap: null,
   selectedTaskId: null,
   selectedExportTaskIds: new Set(),
   refreshing: false,
+  batchRunning: false,
   cardBindingSession: null
 };
 
@@ -37,6 +55,12 @@ const elements = {
   exportAccountsButton: document.querySelector("#export-accounts-button"),
   exportCount: document.querySelector("#account-export-count"),
   exportMessage: document.querySelector("#account-export-message"),
+  batchMessage: document.querySelector("#account-batch-message"),
+  selectFailedButton: document.querySelector("#select-failed-button"),
+  batchRetryCount: document.querySelector("#batch-retry-count"),
+  batchRegisterButton: document.querySelector("#batch-register-button"),
+  batchExtractButton: document.querySelector("#batch-extract-button"),
+  batchSubscribeButton: document.querySelector("#batch-subscribe-button"),
   toast: document.querySelector("#toast")
 };
 
@@ -171,13 +195,34 @@ function setExportMessage(message = "", kind = "") {
     : "form-message account-export-message";
 }
 
+function setBatchMessage(message = "", kind = "") {
+  elements.batchMessage.textContent = message;
+  elements.batchMessage.className = kind
+    ? `form-message account-batch-message ${kind}`
+    : "form-message account-batch-message";
+}
+
 function updateExportControls() {
   const tasks = state.bootstrap && state.bootstrap.tasks || [];
   const ids = new Set(tasks.map((task) => task.id));
   state.selectedExportTaskIds = new Set([...state.selectedExportTaskIds].filter((id) => ids.has(id)));
   const count = state.selectedExportTaskIds.size;
-  elements.exportCount.textContent = `已选择 ${count} 个账号`;
-  elements.exportAccountsButton.disabled = count === 0;
+  const concurrencyReady = count > 0 && count <= 10 && !state.batchRunning;
+  const selectedTasks = tasks.filter((task) => state.selectedExportTaskIds.has(task.id));
+  const everySelectedIn = (states) => selectedTasks.length === count
+    && selectedTasks.every((task) => states.includes(task.state));
+  const hasRetryableFailures = FAILURE_SELECTION_GROUPS.some((group) => (
+    tasks.some((task) => group.states.includes(task.state))
+  ));
+  const retryLimit = Number(state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.maxRetries) || 10;
+  elements.batchRetryCount.max = String(retryLimit);
+  elements.exportCount.textContent = `已选择 ${count} 个账号${count > 10 ? " · 并发批次最多 10 个" : ""}`;
+  elements.exportAccountsButton.disabled = count === 0 || state.batchRunning;
+  elements.selectFailedButton.disabled = !hasRetryableFailures || state.batchRunning;
+  elements.batchRetryCount.disabled = state.batchRunning;
+  elements.batchRegisterButton.disabled = !concurrencyReady || !everySelectedIn(["QUEUED", "REGISTERING_BLOCKED", "REGISTRATION_BLOCKED", "REGISTRATION_FAILED"]);
+  elements.batchExtractButton.disabled = !concurrencyReady || !everySelectedIn(["REGISTERED", "CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED"]);
+  elements.batchSubscribeButton.disabled = !concurrencyReady || !everySelectedIn(["CARD_BOUND", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"]);
   elements.exportSelectAll.checked = tasks.length > 0 && count === tasks.length;
   elements.exportSelectAll.indeterminate = count > 0 && count < tasks.length;
 }
@@ -206,7 +251,7 @@ function renderTasks() {
     selection.type = "checkbox";
     selection.className = "task-export-checkbox";
     selection.checked = state.selectedExportTaskIds.has(task.id);
-    selection.setAttribute("aria-label", `选择账号 ${task.account && task.account.account || task.id} 用于导出`);
+    selection.setAttribute("aria-label", `选择账号 ${task.account && task.account.account || task.id} 用于批量操作`);
     selection.addEventListener("change", () => {
       if (selection.checked) state.selectedExportTaskIds.add(task.id);
       else state.selectedExportTaskIds.delete(task.id);
@@ -574,7 +619,7 @@ for (const button of document.querySelectorAll(".probe-button")) {
 elements.accountSource.addEventListener("input", updateRegistrationActions);
 
 elements.mailboxProbeButton.addEventListener("click", async () => {
-  const accountLine = elements.accountSource.value.trim();
+  const accountLine = elements.accountSource.value.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
   elements.mailboxProbeButton.disabled = true;
   elements.createTaskButton.disabled = true;
   setRegistrationMessage("正在通过 US 代理检查接码平台…");
@@ -598,19 +643,20 @@ elements.mailboxProbeButton.addEventListener("click", async () => {
 
 elements.registrationForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const accountLine = elements.accountSource.value.trim();
+  const text = elements.accountSource.value;
   elements.mailboxProbeButton.disabled = true;
   elements.createTaskButton.disabled = true;
-  setRegistrationMessage("正在创建本地注册任务…");
+  setRegistrationMessage("正在批量识别账号并创建本地注册任务…");
   try {
-    const payload = await api("/api/tasks", {
+    const payload = await api("/api/tasks/import", {
       method: "POST",
-      body: JSON.stringify({ accountLine })
+      body: JSON.stringify({ text })
     });
-    state.selectedTaskId = payload.task.id;
+    const imported = payload.import;
+    state.selectedTaskId = imported.tasks[0] && imported.tasks[0].id || null;
     elements.accountSource.value = "";
     await refresh({ quiet: true });
-    setRegistrationMessage("任务已创建；接码令牌仅保存在本地后端。", "success");
+    setRegistrationMessage(`已导入 ${imported.count} 个任务；每次并发执行最多选择 10 个。`, "success");
   } catch (error) {
     setRegistrationMessage(error.message, "error");
   } finally {
@@ -731,6 +777,96 @@ async function exportSelectedAccounts() {
   } catch (error) {
     setExportMessage(error.message, "error");
   } finally {
+    updateExportControls();
+  }
+}
+
+function selectFailedTasks() {
+  const tasks = state.bootstrap && state.bootstrap.tasks || [];
+  const selectedGroup = FAILURE_SELECTION_GROUPS.find((group) => (
+    tasks.some((task) => group.states.includes(task.state))
+  ));
+  if (!selectedGroup) {
+    setBatchMessage("当前没有可批量重试的失败账号。", "success");
+    return;
+  }
+  const failures = tasks.filter((task) => selectedGroup.states.includes(task.state));
+  const selected = failures.slice(0, 10);
+  state.selectedExportTaskIds = new Set(selected.map((task) => task.id));
+  if (selected[0]) state.selectedTaskId = selected[0].id;
+  renderTasks();
+  const remaining = failures.length - selected.length;
+  setBatchMessage(
+    `已选择 ${selected.length} 个${selectedGroup.label}账号${remaining > 0 ? `；另有 ${remaining} 个留待下一批` : ""}。`,
+    "success"
+  );
+}
+
+async function runSelectedBatch(stage, button) {
+  const ids = [...state.selectedExportTaskIds];
+  if (!ids.length || ids.length > 10) {
+    setBatchMessage("请选择 1–10 个账号执行并发批次。", "error");
+    return;
+  }
+  const retryLimit = Number(state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.maxRetries) || 10;
+  const configuredRetries = Number(elements.batchRetryCount.value);
+  if (!Number.isInteger(configuredRetries) || configuredRetries < 0 || configuredRetries > retryLimit) {
+    setBatchMessage(`自动重试次数必须是 0–${retryLimit} 的整数。`, "error");
+    elements.batchRetryCount.focus();
+    return;
+  }
+  const maxRetries = stage === "trial_payment" ? 0 : configuredRetries;
+  if (stage === "trial_payment") {
+    const accepted = window.confirm(
+      `确认同步订阅所选 ${ids.length} 个账号？系统会先等待全部 Checkout、支付方式和确认令牌完全加载；任一账号准备失败时发送 0 个 confirm 请求，全部就绪后在同一事件循环批次内统一放行。试用结束后会按结账页价格自动续费，除非提前取消。`
+    );
+    if (!accepted) return;
+  }
+
+  const labels = {
+    registration: "并发注册",
+    checkout_link: "并发提链",
+    trial_payment: "同步订阅"
+  };
+  state.batchRunning = true;
+  updateExportControls();
+  button.textContent = stage === "trial_payment" ? "等待全部加载…" : "并发执行中…";
+  setBatchMessage(`${labels[stage]}已启动：${ids.length}/10 个账号${stage === "trial_payment" ? "" : `，失败后最多自动重试 ${maxRetries} 次`}。`);
+  try {
+    const payload = await api("/api/tasks/batch/run", {
+      method: "POST",
+      body: JSON.stringify({
+        ids,
+        stage,
+        maxRetries,
+        ...(stage === "trial_payment" ? { confirmed: true } : {})
+      })
+    });
+    const batch = payload.batch;
+    await refresh({ quiet: true });
+    if (stage === "trial_payment" && batch.confirmationsDispatched === 0) {
+      setBatchMessage(
+        `同步屏障在 ${batch.status} 阶段停止：0 个 confirm 请求已发送，请查看失败账号日志。`,
+        "error"
+      );
+    } else if (stage === "trial_payment") {
+      setBatchMessage(
+        `同步放行 ${batch.confirmationsDispatched}/${batch.requested} 个 confirm 请求；调度偏差 ${Number(batch.dispatchSkewMs || 0).toFixed(3)} ms，激活 ${batch.completed}/${batch.requested} 个。`,
+        batch.failures && batch.failures.length ? "error" : "success"
+      );
+    } else {
+      const successState = stage === "registration" ? "REGISTERED" : "CHECKOUT_LINK_READY";
+      const completed = (batch.tasks || []).filter((task) => task.state === successState).length;
+      setBatchMessage(
+        `${labels[stage]}完成：${completed}/${batch.requested} 个账号进入下一阶段；自动重试 ${batch.retryRounds}/${batch.maxRetries} 轮，共重跑 ${batch.retryExecutions} 个任务。`,
+        completed === batch.requested ? "success" : "error"
+      );
+    }
+  } catch (error) {
+    setBatchMessage(error.message, "error");
+  } finally {
+    state.batchRunning = false;
+    button.textContent = labels[stage];
     updateExportControls();
   }
 }
@@ -965,6 +1101,10 @@ elements.exportSelectAll.addEventListener("change", () => {
   renderTasks();
 });
 elements.exportAccountsButton.addEventListener("click", exportSelectedAccounts);
+elements.selectFailedButton.addEventListener("click", selectFailedTasks);
+elements.batchRegisterButton.addEventListener("click", () => runSelectedBatch("registration", elements.batchRegisterButton));
+elements.batchExtractButton.addEventListener("click", () => runSelectedBatch("checkout_link", elements.batchExtractButton));
+elements.batchSubscribeButton.addEventListener("click", () => runSelectedBatch("trial_payment", elements.batchSubscribeButton));
 elements.refreshButton.addEventListener("click", async () => {
   await disposeCardBindingPanel();
   refresh();

@@ -27,6 +27,20 @@ const BLOCKED_STAGE_CODES = new Set([
 ]);
 const ACCOUNT_EXPORT_FORMATS = Object.freeze(["email_url", "access_token"]);
 const MAX_EXPORT_ACCOUNTS = 500;
+const MAX_IMPORT_ACCOUNTS = 500;
+const MAX_BATCH_TASKS = 10;
+const MAX_BATCH_RETRIES = 10;
+const DEFAULT_BATCH_RETRY_DELAY_MS = 5_000;
+const BATCH_RUN_STATES = Object.freeze({
+  registration: new Set(["QUEUED", "REGISTERING_BLOCKED", "REGISTRATION_BLOCKED", "REGISTRATION_FAILED"]),
+  checkout_link: new Set(["REGISTERED", "CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED"]),
+  trial_payment: new Set(["CARD_BOUND", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"])
+});
+const BATCH_SUCCESS_STATES = Object.freeze({
+  registration: "REGISTERED",
+  checkout_link: "CHECKOUT_LINK_READY",
+  trial_payment: "TRIAL_ACTIVE"
+});
 
 function checkoutCreatedAfterCardBinding(task) {
   const checkoutAt = Date.parse(task && task.context && task.context.checkout_link
@@ -37,13 +51,27 @@ function checkoutCreatedAfterCardBinding(task) {
 }
 
 class TaskOrchestrator {
-  constructor({ store, proxyPools, adapters, profileAddressGenerator = null, sessionDirectory = null, accountExportClient = null }) {
+  constructor({
+    store,
+    proxyPools,
+    adapters,
+    profileAddressGenerator = null,
+    sessionDirectory = null,
+    accountExportClient = null,
+    sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    batchRetryDelayMs = DEFAULT_BATCH_RETRY_DELAY_MS
+  }) {
     this.store = store;
     this.proxyPools = proxyPools;
     this.adapters = adapters;
     this.profileAddressGenerator = profileAddressGenerator;
     this.sessionDirectory = sessionDirectory ? path.resolve(sessionDirectory) : null;
     this.accountExportClient = accountExportClient;
+    this.sleep = sleep;
+    const parsedRetryDelay = Number(batchRetryDelayMs);
+    this.batchRetryDelayMs = Number.isFinite(parsedRetryDelay)
+      ? Math.max(0, Math.min(parsedRetryDelay, 60_000))
+      : DEFAULT_BATCH_RETRY_DELAY_MS;
     this.tasks = [];
     this.running = new Set();
   }
@@ -68,6 +96,18 @@ class TaskOrchestrator {
 
   pipeline() {
     return PIPELINE.map((stage) => ({ ...stage }));
+  }
+
+  batchConfiguration() {
+    return Object.freeze({
+      maxConcurrency: MAX_BATCH_TASKS,
+      maxImportSize: MAX_IMPORT_ACCOUNTS,
+      maxRetries: MAX_BATCH_RETRIES,
+      defaultRetries: 2,
+      retryDelayMs: this.batchRetryDelayMs,
+      stages: ["registration", "checkout_link", "trial_payment"],
+      subscriptionMode: "synchronized_barrier"
+    });
   }
 
   adapterStatus() {
@@ -396,6 +436,13 @@ class TaskOrchestrator {
   async create(input = {}) {
     this.proxyPools.requireConfigured();
     const registration = this.adapters.registration.prepare(input);
+    const task = this.buildTask(registration);
+    this.tasks.push(task);
+    await this.persist();
+    return this.publicTask(task);
+  }
+
+  buildTask(registration) {
     const now = new Date().toISOString();
     const task = {
       id: crypto.randomUUID(),
@@ -408,15 +455,393 @@ class TaskOrchestrator {
       context: { registration: registration.private },
       logs: []
     };
-    this.log(task, "info", "任务已创建，等待执行注册阶段");
-    this.tasks.push(task);
+    this.log(task, "info", "Task created and queued for registration.");
+    return task;
+  }
+
+  async importAccounts(input = {}) {
+    this.proxyPools.requireConfigured();
+    const source = Array.isArray(input.accountLines)
+      ? input.accountLines.join("\n")
+      : String(input.text || input.accountLines || "");
+    const lines = source.split(/\r?\n/)
+      .map((line, index) => ({ line: line.trim(), number: index + 1 }))
+      .filter((entry) => entry.line);
+    if (!lines.length) {
+      throw new AppError(400, "ACCOUNT_IMPORT_EMPTY", "Enter at least one account line to import.");
+    }
+    if (lines.length > MAX_IMPORT_ACCOUNTS) {
+      throw new AppError(400, "ACCOUNT_IMPORT_TOO_LARGE", `At most ${MAX_IMPORT_ACCOUNTS} accounts can be imported at once.`);
+    }
+
+    const registrations = lines.map((entry) => {
+      try {
+        return this.adapters.registration.prepare({ accountLine: entry.line });
+      } catch (error) {
+        throw new AppError(
+          Number(error && error.status) || 400,
+          error && error.code || "ACCOUNT_IMPORT_LINE_INVALID",
+          `Line ${entry.number}: ${error && error.message || "invalid account source"}`
+        );
+      }
+    });
+    const tasks = registrations.map((registration) => this.buildTask(registration));
+    this.tasks.push(...tasks);
     await this.persist();
-    return this.publicTask(task);
+    return Object.freeze({
+      count: tasks.length,
+      tasks: tasks.map((task) => this.publicTask(task))
+    });
+  }
+
+  normalizeBatchRequest(input = {}) {
+    const stage = String(input.stage || "").trim().toLowerCase();
+    if (!Object.hasOwn(BATCH_RUN_STATES, stage)) {
+      throw new AppError(400, "TASK_BATCH_STAGE_INVALID", "Batch stage must be registration, checkout_link, or trial_payment.");
+    }
+    const ids = [...new Set((Array.isArray(input.ids) ? input.ids : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean))];
+    if (!ids.length) {
+      throw new AppError(400, "TASK_BATCH_SELECTION_REQUIRED", "Select at least one task for the batch.");
+    }
+    if (ids.length > MAX_BATCH_TASKS) {
+      throw new AppError(400, "TASK_BATCH_TOO_LARGE", `At most ${MAX_BATCH_TASKS} tasks can run concurrently.`);
+    }
+    const tasks = ids.map((id) => this.find(id));
+    if (this.running.size + tasks.length > MAX_BATCH_TASKS) {
+      throw new AppError(409, "TASK_CONCURRENCY_LIMIT", `The global concurrency limit is ${MAX_BATCH_TASKS} tasks.`);
+    }
+    for (const task of tasks) {
+      if (this.running.has(task.id)) {
+        throw new AppError(409, "TASK_ALREADY_RUNNING", `Task ${task.id} is already running.`);
+      }
+      if (!BATCH_RUN_STATES[stage].has(task.state)) {
+        throw new AppError(409, "TASK_BATCH_STATE_INVALID", `Task ${task.id} is ${task.state}, which is not ready for ${stage}.`);
+      }
+    }
+    return { stage, ids, tasks };
+  }
+
+  normalizeBatchRetryCount(input = {}) {
+    const value = input.maxRetries == null || input.maxRetries === ""
+      ? 0
+      : Number(input.maxRetries);
+    if (!Number.isInteger(value) || value < 0 || value > MAX_BATCH_RETRIES) {
+      throw new AppError(
+        400,
+        "TASK_BATCH_RETRY_COUNT_INVALID",
+        `maxRetries must be an integer from 0 through ${MAX_BATCH_RETRIES}.`
+      );
+    }
+    return value;
+  }
+
+  async runBatch(input = {}) {
+    const batch = this.normalizeBatchRequest(input);
+    const maxRetries = this.normalizeBatchRetryCount(input);
+    if (batch.stage === "trial_payment") {
+      if (maxRetries > 0) {
+        throw new AppError(
+          400,
+          "TRIAL_BATCH_AUTORETRY_UNSUPPORTED",
+          "Automatic retries apply to registration and checkout extraction; synchronized subscription remains a single barrier release."
+        );
+      }
+      if (input.confirmed !== true) {
+        throw new AppError(409, "TRIAL_SUBSCRIPTION_CONFIRMATION_REQUIRED", "Confirm the subscription and renewal terms before continuing.");
+      }
+      return this.runSynchronizedTrialBatch(batch.tasks);
+    }
+    const attemptsByTask = new Map(batch.tasks.map((task) => [task.id, 0]));
+    let pending = [...batch.tasks];
+    let retryRounds = 0;
+    let retryExecutions = 0;
+    while (pending.length) {
+      const round = await Promise.allSettled(pending.map(async (task) => {
+        attemptsByTask.set(task.id, attemptsByTask.get(task.id) + 1);
+        return this.run(task.id);
+      }));
+      for (let index = 0; index < round.length; index += 1) {
+        const outcome = round[index];
+        if (outcome.status === "rejected") {
+          const task = pending[index];
+          task.updatedAt = new Date().toISOString();
+          this.log(task, "error", sanitizeText(outcome.reason && outcome.reason.message, 300), {
+            code: outcome.reason && outcome.reason.code || "TASK_BATCH_EXECUTION_FAILED"
+          });
+        }
+      }
+      if (round.some((outcome) => outcome.status === "rejected")) await this.persist();
+      const retryable = pending.filter((task) => BATCH_RUN_STATES[batch.stage].has(task.state));
+      if (!retryable.length || retryRounds >= maxRetries) break;
+      retryRounds += 1;
+      retryExecutions += retryable.length;
+      for (const task of retryable) {
+        task.updatedAt = new Date().toISOString();
+        this.log(task, "warning", `Automatic retry ${retryRounds}/${maxRetries} is scheduled after the transient-node delay.`, {
+          retryRound: retryRounds,
+          maxRetries,
+          delayMs: this.batchRetryDelayMs,
+          priorState: task.state
+        });
+      }
+      await this.persist();
+      if (this.batchRetryDelayMs) await this.sleep(this.batchRetryDelayMs);
+      pending = retryable;
+    }
+    const results = batch.tasks.map((task) => this.publicTask(task));
+    const failures = results
+      .filter((task) => BATCH_RUN_STATES[batch.stage].has(task.state))
+      .map((task) => ({ id: task.id, state: task.state }));
+    return Object.freeze({
+      stage: batch.stage,
+      mode: "parallel",
+      limit: MAX_BATCH_TASKS,
+      requested: results.length,
+      completed: results.filter((task) => task.state === BATCH_SUCCESS_STATES[batch.stage]).length,
+      maxRetries,
+      retryDelayMs: this.batchRetryDelayMs,
+      retryRounds,
+      retryExecutions,
+      attemptsByTask: results.map((task) => ({
+        id: task.id,
+        attempts: attemptsByTask.get(task.id) || 0
+      })),
+      failures,
+      tasks: results
+    });
+  }
+
+  applyTrialFailure(task, error) {
+    const blocked = Number(error && error.status) === 501
+      || BLOCKED_STAGE_CODES.has(String(error && error.code || ""));
+    task.state = blocked ? "TRIAL_PAYMENT_BLOCKED" : "TRIAL_PAYMENT_FAILED";
+    task.currentStage = "trial_payment";
+    this.setStage(task, "trial_payment", blocked ? "BLOCKED" : "FAILED");
+    task.updatedAt = new Date().toISOString();
+    this.log(task, blocked ? "warning" : "error", sanitizeText(error && error.message, 300), {
+      code: error && error.code || "TRIAL_PAYMENT_FAILED"
+    });
+  }
+
+  async runSynchronizedTrialBatch(tasks) {
+    const adapter = this.adapters.trialPayment;
+    if (!adapter || typeof adapter.supportsSynchronizedBatch !== "function" || !adapter.supportsSynchronizedBatch()) {
+      throw new AppError(503, "TRIAL_SYNCHRONIZED_BATCH_UNAVAILABLE", "The synchronized subscription client is not initialized.");
+    }
+
+    const entries = tasks.map((task, batchIndex) => {
+      const regions = ["US", "TR"];
+      const proxies = Object.fromEntries(regions.map((region, offset) => [
+        region,
+        this.proxyPools.select(region, task.logs.length + (batchIndex * regions.length) + offset)
+      ]));
+      const trialStage = task.stages.find((stage) => stage.key === "trial_payment");
+      return {
+        task,
+        proxies,
+        proxy: proxies.US,
+        previousState: task.state,
+        previousStageState: trialStage && trialStage.state || "PENDING",
+        prepared: null,
+        reportProgress: async (message, details = undefined) => {
+          task.updatedAt = new Date().toISOString();
+          this.log(task, "info", message, details);
+          await this.persist();
+        }
+      };
+    });
+
+    for (const entry of entries) {
+      this.running.add(entry.task.id);
+      entry.task.state = "REQUESTING_TRIAL";
+      entry.task.currentStage = "trial_payment";
+      entry.task.updatedAt = new Date().toISOString();
+      this.setStage(entry.task, "trial_payment", "RUNNING");
+      this.log(entry.task, "info", "Synchronized subscription preparation started: Checkout, billing, Payment Element, and confirmation token.", {
+        batchSize: entries.length,
+        proxies: Object.fromEntries(Object.entries(entry.proxies).map(([region, selected]) => [
+          region,
+          summarizeProxy(selected, 0).endpoint
+        ]))
+      });
+    }
+    await this.persist();
+
+    const abortBeforeConfirm = async (settled, phase) => {
+      const failures = [];
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        const outcome = settled[index];
+        if (outcome.status === "rejected") {
+          const error = outcome.reason;
+          this.applyTrialFailure(entry.task, error);
+          failures.push({
+            id: entry.task.id,
+            error: String(error && error.code || "TRIAL_BATCH_PREPARE_FAILED"),
+            message: sanitizeText(error && error.message, 200)
+          });
+        } else {
+          entry.task.state = entry.previousState;
+          this.setStage(entry.task, "trial_payment", entry.previousStageState);
+          entry.task.updatedAt = new Date().toISOString();
+          this.log(entry.task, "warning", "The synchronized batch stopped before release; no confirm request was sent.", {
+            phase,
+            confirmationsDispatched: 0
+          });
+        }
+      }
+      await this.persist();
+      return Object.freeze({
+        stage: "trial_payment",
+        mode: "synchronized_barrier",
+        status: `${phase}_failed`,
+        limit: MAX_BATCH_TASKS,
+        requested: entries.length,
+        prepared: entries.filter((entry) => entry.prepared).length,
+        confirmationsDispatched: 0,
+        confirmationDispatchedAt: null,
+        dispatchSkewMs: null,
+        failures,
+        tasks: entries.map((entry) => this.publicTask(entry.task))
+      });
+    };
+
+    try {
+      const prepared = await Promise.allSettled(entries.map(async (entry) => {
+        const task = entry.task;
+        if (!checkoutCreatedAfterCardBinding(task)) {
+          await entry.reportProgress("Refreshing the active Checkout concurrently after card binding.");
+          const refreshed = await this.adapters.checkoutLink.execute({
+            taskId: task.id,
+            proxies: entry.proxies,
+            accountSession: task.context.accountSession,
+            reportProgress: entry.reportProgress
+          });
+          if (!refreshed || !refreshed.checkoutUrl) {
+            throw new AppError(502, "TRIAL_CHECKOUT_REFRESH_FAILED", "The refreshed checkout did not include a URL.");
+          }
+          task.context.checkout_link = refreshed;
+          task.context.checkoutUrl = refreshed.checkoutUrl;
+          task.updatedAt = new Date().toISOString();
+          this.log(task, "success", "The post-binding Checkout was refreshed.");
+          await this.persist();
+        }
+        entry.prepared = await adapter.prepare({
+          taskId: task.id,
+          proxy: entry.proxy,
+          proxies: entry.proxies,
+          registration: task.context.registration,
+          accountSession: task.context.accountSession,
+          checkoutUrl: task.context.checkoutUrl,
+          cardProfile: task.context.card_profile,
+          cardBinding: task.context.card_binding,
+          confirmed: true,
+          reportProgress: entry.reportProgress
+        });
+        return entry.prepared;
+      }));
+      if (prepared.some((outcome) => outcome.status === "rejected")) {
+        return await abortBeforeConfirm(prepared, "prepare");
+      }
+
+      for (const entry of entries) {
+        this.log(entry.task, "info", `All ${entries.length}/${entries.length} Checkout pages are fully loaded; arming synchronized approval headers.`);
+      }
+      await this.persist();
+      const armed = await Promise.allSettled(entries.map((entry) => adapter.arm(entry.prepared)));
+      if (armed.some((outcome) => outcome.status === "rejected")) {
+        return await abortBeforeConfirm(armed, "arm");
+      }
+
+      const confirmationDispatchedAt = new Date().toISOString();
+      const dispatchMarks = [];
+      for (const entry of entries) {
+        this.log(entry.task, "info", "All accounts are ready; confirm requests are released in one event-loop batch.", {
+          confirmationDispatchedAt,
+          batchSize: entries.length
+        });
+      }
+      await this.persist();
+
+      const confirmationPromises = entries.map((entry) => {
+        if (entry.prepared && entry.prepared.requiresConfirmation !== false) {
+          dispatchMarks.push(process.hrtime.bigint());
+        }
+        return adapter.confirm(entry.prepared);
+      });
+      const dispatchSkewMs = dispatchMarks.length > 1
+        ? Number(dispatchMarks.at(-1) - dispatchMarks[0]) / 1_000_000
+        : 0;
+
+      const verified = await Promise.allSettled(entries.map(async (entry, index) => {
+        const confirmation = await confirmationPromises[index];
+        return adapter.verify(entry.prepared, confirmation);
+      }));
+      const failures = [];
+      let completed = 0;
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        const outcome = verified[index];
+        if (outcome.status === "rejected") {
+          this.applyTrialFailure(entry.task, outcome.reason);
+          failures.push({
+            id: entry.task.id,
+            error: String(outcome.reason && outcome.reason.code || "TRIAL_PAYMENT_FAILED"),
+            message: sanitizeText(outcome.reason && outcome.reason.message, 200)
+          });
+          continue;
+        }
+        try {
+          entry.task.context.trial_payment = normalizeTrialSubscriptionResult(outcome.value);
+          entry.task.state = "TRIAL_ACTIVE";
+          entry.task.currentStage = "trial_payment";
+          this.setStage(entry.task, "trial_payment", "COMPLETED");
+          entry.task.updatedAt = new Date().toISOString();
+          this.log(entry.task, "success", "Synchronized subscription completed and Plus entitlement is active.", {
+            confirmationDispatchedAt,
+            dispatchSkewMs
+          });
+          completed += 1;
+        } catch (error) {
+          this.applyTrialFailure(entry.task, error);
+          failures.push({
+            id: entry.task.id,
+            error: String(error && error.code || "TRIAL_PAYMENT_FAILED"),
+            message: sanitizeText(error && error.message, 200)
+          });
+        }
+      }
+      await this.persist();
+      return Object.freeze({
+        stage: "trial_payment",
+        mode: "synchronized_barrier",
+        status: failures.length ? "completed_with_failures" : "completed",
+        limit: MAX_BATCH_TASKS,
+        requested: entries.length,
+        prepared: entries.length,
+        confirmationsDispatched: entries.filter((entry) => entry.prepared && entry.prepared.requiresConfirmation !== false).length,
+        completed,
+        confirmationDispatchedAt,
+        dispatchSkewMs,
+        failures,
+        tasks: entries.map((entry) => this.publicTask(entry.task))
+      });
+    } finally {
+      await Promise.allSettled(entries
+        .filter((entry) => entry.prepared)
+        .map((entry) => adapter.close(entry.prepared)));
+      for (const entry of entries) this.running.delete(entry.task.id);
+    }
   }
 
   async run(id, input = {}) {
     const task = this.find(id);
     if (this.running.has(id)) throw new AppError(409, "TASK_ALREADY_RUNNING", "任务正在执行。");
+    if (this.running.size >= MAX_BATCH_TASKS) {
+      throw new AppError(409, "TASK_CONCURRENCY_LIMIT", `The global concurrency limit is ${MAX_BATCH_TASKS} tasks.`);
+    }
     if (task.state === "TRIAL_ACTIVE") return this.publicTask(task);
     const trialRunnable = ["CARD_BOUND", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"].includes(task.state);
     if (trialRunnable && input.confirmed !== true) {
@@ -573,7 +998,7 @@ class TaskOrchestrator {
   }
 
   async persist() {
-    await this.store.write({ tasks: this.tasks });
+    await this.store.write(structuredClone({ tasks: this.tasks }));
   }
 
   publicTask(task) {
