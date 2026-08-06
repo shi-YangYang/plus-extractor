@@ -96,6 +96,7 @@ function applyCors(request, response) {
 
 async function createApplication(options = {}) {
   const dataDirectory = path.resolve(options.dataDirectory || process.env.LOCAL_WEB_DATA_DIR || path.join(__dirname, "../data"));
+  const sessionDirectory = path.join(dataDirectory, "sessions");
   const proxyPools = new ProxyPoolService(new JsonStore(path.join(dataDirectory, "proxy-pools.json"), { US: "", TR: "" }));
   await proxyPools.init();
 
@@ -104,7 +105,7 @@ async function createApplication(options = {}) {
     : Object.hasOwn(options, "registrationDriver")
     ? options.registrationDriver
     : new ChatGptProtocolRegistrationClient({
-      sessionDirectory: path.join(dataDirectory, "sessions")
+      sessionDirectory
     });
   const checkoutClient = Object.hasOwn(options, "checkoutClient")
     ? options.checkoutClient
@@ -120,7 +121,7 @@ async function createApplication(options = {}) {
     : new ProfileAddressGenerator();
   const accountExportClient = Object.hasOwn(options, "accountExportClient")
     ? options.accountExportClient
-    : new AccountExportService();
+    : new AccountExportService({ sessionDirectory });
   const adapters = {
     registration: new RegistrationAdapter({
       mailboxReader: options.mailboxReader,
@@ -135,7 +136,7 @@ async function createApplication(options = {}) {
     proxyPools,
     adapters,
     profileAddressGenerator,
-    sessionDirectory: path.join(dataDirectory, "sessions"),
+    sessionDirectory,
     accountExportClient,
     sleep: options.taskSleep,
     batchRetryDelayMs: options.batchRetryDelayMs
@@ -221,6 +222,25 @@ async function createApplication(options = {}) {
       if (request.method === "POST" && url.pathname === "/api/tasks/batch/run") {
         const body = await readJson(request);
         sendJson(response, 200, { ok: true, batch: await tasks.runBatch(body) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/tasks/batch/card-binding/prepare") {
+        const body = await readJson(request);
+        sendJson(response, 200, { ok: true, batch: await tasks.prepareCardBindingBatch(body) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/tasks/batch/card-profile") {
+        const body = await readJson(request);
+        sendJson(response, 200, { ok: true, batch: await tasks.generateCardProfileBatch(body) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/tasks/batch/card-binding/complete") {
+        const body = await readJson(request);
+        rejectRawCardData(body);
+        sendJson(response, 200, { ok: true, batch: await tasks.completeCardBindingBatch(body) });
         return;
       }
 

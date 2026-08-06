@@ -27,6 +27,7 @@ const BLOCKED_STAGE_CODES = new Set([
 ]);
 const ACCOUNT_EXPORT_FORMATS = Object.freeze(["email_url", "access_token"]);
 const MAX_EXPORT_ACCOUNTS = 500;
+const MAX_EXPORT_REFRESH_CONCURRENCY = 10;
 const MAX_IMPORT_ACCOUNTS = 500;
 const MAX_BATCH_TASKS = 10;
 const MAX_BATCH_RETRIES = 10;
@@ -48,6 +49,20 @@ function checkoutCreatedAfterCardBinding(task) {
   const boundAt = Date.parse(task && task.context && task.context.card_binding
     && task.context.card_binding.boundAt || "");
   return Number.isFinite(checkoutAt) && Number.isFinite(boundAt) && checkoutAt > boundAt;
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
 }
 
 class TaskOrchestrator {
@@ -106,6 +121,12 @@ class TaskOrchestrator {
       defaultRetries: 2,
       retryDelayMs: this.batchRetryDelayMs,
       stages: ["registration", "checkout_link", "trial_payment"],
+      authSessionExportMode: "registration_cache_parallel_refresh",
+      authSessionRefreshConcurrency: MAX_EXPORT_REFRESH_CONCURRENCY,
+      cardProfileBatchMaxConcurrency: MAX_BATCH_TASKS,
+      cardBindingMode: "shared_hosted_element_parallel",
+      cardBindingMaxConcurrency: MAX_BATCH_TASKS,
+      cardBindingAutoRetry: true,
       subscriptionMode: "synchronized_barrier"
     });
   }
@@ -210,8 +231,7 @@ class TaskOrchestrator {
     const selected = ids.map((id) => this.find(id));
     const lines = [];
     const failures = [];
-    for (let index = 0; index < selected.length; index += 1) {
-      const task = selected[index];
+    const results = await mapWithConcurrency(selected, MAX_EXPORT_REFRESH_CONCURRENCY, async (task, index) => {
       try {
         if (format === "email_url") {
           const registration = task.context && task.context.registration;
@@ -220,35 +240,49 @@ class TaskOrchestrator {
           if (!email || !inboxUrl) {
             throw new AppError(409, "ACCOUNT_EXPORT_SOURCE_MISSING", "The account is missing its email or mailbox URL.");
           }
-          lines.push(`${email}---${inboxUrl}`);
+          return { line: `${email}---${inboxUrl}` };
         } else {
-          if (!this.accountExportClient || typeof this.accountExportClient.readAccessToken !== "function") {
-            throw new AppError(503, "ACCOUNT_EXPORT_CLIENT_MISSING", "The access-token export client is not initialized.");
+          if (!this.accountExportClient || typeof this.accountExportClient.readAuthSession !== "function") {
+            throw new AppError(503, "ACCOUNT_EXPORT_CLIENT_MISSING", "The auth-session JSON export client is not initialized.");
           }
           const accountSession = task.context && task.context.accountSession;
           const proxy = this.proxyPools.select("US", task.logs.length + index);
-          lines.push(await this.accountExportClient.readAccessToken({
+          const authSession = await this.accountExportClient.readAuthSession({
             taskId: task.id,
             accountSession,
             proxy
-          }));
+          });
+          if (!authSession || typeof authSession !== "object" || Array.isArray(authSession)) {
+            throw new AppError(502, "ACCOUNT_EXPORT_SESSION_INVALID", "The session endpoint returned an invalid JSON document.");
+          }
+          const sessionLine = JSON.stringify(authSession);
+          if (!sessionLine) {
+            throw new AppError(502, "ACCOUNT_EXPORT_SESSION_INVALID", "The session endpoint returned an empty JSON document.");
+          }
+          return { line: sessionLine };
         }
       } catch (error) {
-        failures.push({
+        return { failure: {
           id: task.id,
           account: task.account && task.account.account || task.id,
           error: String(error && error.code || "ACCOUNT_EXPORT_FAILED"),
           message: sanitizeText(error && error.message, 200)
-        });
+        } };
       }
+    });
+    for (const result of results) {
+      if (result.line) lines.push(result.line);
+      else failures.push(result.failure);
     }
     if (!lines.length) {
       throw new AppError(409, "ACCOUNT_EXPORT_EMPTY", failures[0] && failures[0].message || "No accounts were exported.");
     }
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filenameType = format === "access_token" ? "auth-session-json" : "email-url";
     return Object.freeze({
       format,
-      filename: `plus-extractor-${format}-${stamp}.txt`,
+      recordType: format === "access_token" ? "auth_session_json" : "email_url",
+      filename: `plus-extractor-${filenameType}-${stamp}.txt`,
       mediaType: "text/plain; charset=utf-8",
       count: lines.length,
       requested: selected.length,
@@ -278,16 +312,37 @@ class TaskOrchestrator {
     return candidate;
   }
 
+  savedAuthSessionPath(task) {
+    const session = task && task.context && task.context.accountSession;
+    if (!this.sessionDirectory || !session) return null;
+    const explicit = String(session.authSessionPath || "").trim();
+    const storagePath = String(session.path || "").trim();
+    const derived = storagePath.toLowerCase().endsWith(".storage.json")
+      ? storagePath.slice(0, -".storage.json".length) + ".auth-session.json"
+      : "";
+    if (!explicit && !derived) return null;
+    const candidate = path.resolve(explicit || derived);
+    const relative = path.relative(this.sessionDirectory, candidate);
+    const outsideDirectory = !relative
+      || relative === ".."
+      || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative);
+    if (outsideDirectory || !candidate.toLowerCase().endsWith(".auth-session.json")) return null;
+    return candidate;
+  }
+
   async removeSavedSession(task) {
-    const sessionPath = this.savedSessionPath(task);
-    if (!sessionPath) return false;
-    try {
-      await fs.unlink(sessionPath);
-      return true;
-    } catch (error) {
-      if (error && error.code === "ENOENT") return false;
-      return false;
+    const paths = [this.savedSessionPath(task), this.savedAuthSessionPath(task)].filter(Boolean);
+    let removed = false;
+    for (const sessionPath of paths) {
+      try {
+        await fs.unlink(sessionPath);
+        removed = true;
+      } catch (_) {
+        // Missing or already-removed session artifacts do not block account deletion.
+      }
     }
+    return removed;
   }
 
   async generateCardProfile(id) {
@@ -306,6 +361,29 @@ class TaskOrchestrator {
     this.log(task, "success", "已生成绑卡所需的姓名、邮编和完整地址");
     await this.persist();
     return this.publicTask(task);
+  }
+
+  async generateCardProfileBatch(input = {}) {
+    const tasks = this.normalizeCardBindingBatchTasks(input);
+    if (!this.profileAddressGenerator) {
+      throw new AppError(503, "PROFILE_ADDRESS_GENERATOR_MISSING", "The profile-address generator is not initialized.");
+    }
+    const generatedAt = new Date().toISOString();
+    for (const task of tasks) {
+      task.context = task.context || {};
+      task.context.card_profile = this.profileAddressGenerator.generate();
+      task.updatedAt = generatedAt;
+      this.log(task, "success", "Batch action generated a fresh billing name and address for the selected account.");
+    }
+    await this.persist();
+    return Object.freeze({
+      stage: "card_profile",
+      mode: "parallel_profile_generation",
+      limit: MAX_BATCH_TASKS,
+      requested: tasks.length,
+      generated: tasks.length,
+      tasks: Object.freeze(tasks.map((task) => this.publicTask(task)))
+    });
   }
 
   async prepareCardBinding(id) {
@@ -431,6 +509,195 @@ class TaskOrchestrator {
       await this.persist();
     }
     return result;
+  }
+
+  normalizeCardBindingBatchTasks(input = {}) {
+    if (!Array.isArray(input.ids) || !input.ids.length) {
+      throw new AppError(400, "CARD_BINDING_BATCH_IDS_REQUIRED", "Select at least one account for concurrent card binding.");
+    }
+    const ids = [...new Set(input.ids.map((value) => String(value || "").trim()).filter(Boolean))];
+    if (ids.length !== input.ids.length) {
+      throw new AppError(400, "CARD_BINDING_BATCH_IDS_INVALID", "Concurrent card-binding task ids must be unique and non-empty.");
+    }
+    if (ids.length > MAX_BATCH_TASKS) {
+      throw new AppError(400, "CARD_BINDING_BATCH_TOO_LARGE", `Concurrent card binding accepts at most ${MAX_BATCH_TASKS} accounts.`);
+    }
+    const tasks = ids.map((id) => this.find(id));
+    if (this.running.size + tasks.length > MAX_BATCH_TASKS) {
+      throw new AppError(409, "TASK_CONCURRENCY_LIMIT", `The global concurrency limit is ${MAX_BATCH_TASKS} tasks.`);
+    }
+    for (const task of tasks) {
+      if (this.running.has(task.id)) throw new AppError(409, "TASK_ALREADY_RUNNING", `Task ${task.id} is already running.`);
+      if (!CARD_BINDABLE_STATES.has(task.state)) {
+        throw new AppError(409, "CARD_BINDING_BATCH_STATE_INVALID", `Task ${task.id} is ${task.state}, which is not ready for card binding.`);
+      }
+      if (!task.context || !task.context.accountSession) {
+        throw new AppError(409, "ACCOUNT_SESSION_REQUIRED", `Task ${task.id} does not have a saved account session.`);
+      }
+    }
+    return tasks;
+  }
+
+  async prepareCardBindingBatch(input = {}) {
+    const tasks = this.normalizeCardBindingBatchTasks(input);
+    const maxRetries = this.normalizeBatchRetryCount(input);
+    let generatedProfiles = 0;
+    for (const task of tasks) {
+      task.context = task.context || {};
+      if (!task.context.card_profile) {
+        if (!this.profileAddressGenerator) {
+          throw new AppError(503, "PROFILE_ADDRESS_GENERATOR_MISSING", "The profile-address generator is not initialized.");
+        }
+        task.context.card_profile = this.profileAddressGenerator.generate();
+        task.updatedAt = new Date().toISOString();
+        this.log(task, "success", "Concurrent card binding generated the required billing name and address.");
+        generatedProfiles += 1;
+      }
+    }
+    if (generatedProfiles) await this.persist();
+
+    const attemptsByTask = new Map(tasks.map((task) => [task.id, 0]));
+    const preparationByTask = new Map();
+    const lastErrorByTask = new Map();
+    let pending = [...tasks];
+    let retryRounds = 0;
+    let retryExecutions = 0;
+    while (pending.length) {
+      const roundTasks = [...pending];
+      const settled = await Promise.allSettled(roundTasks.map(async (task) => {
+        attemptsByTask.set(task.id, attemptsByTask.get(task.id) + 1);
+        return this.prepareCardBinding(task.id);
+      }));
+      const retryable = [];
+      for (let index = 0; index < settled.length; index += 1) {
+        const outcome = settled[index];
+        const task = roundTasks[index];
+        if (outcome.status === "fulfilled") {
+          preparationByTask.set(task.id, Object.freeze({ taskId: task.id, ...outcome.value }));
+        } else {
+          lastErrorByTask.set(task.id, outcome.reason);
+          if (CARD_BINDABLE_STATES.has(task.state)) retryable.push(task);
+        }
+      }
+      if (!retryable.length || retryRounds >= maxRetries) break;
+      retryRounds += 1;
+      retryExecutions += retryable.length;
+      for (const task of retryable) {
+        this.log(task, "warning", `Card-binding preparation retry ${retryRounds}/${maxRetries} is scheduled.`, {
+          retryRound: retryRounds,
+          maxRetries,
+          delayMs: this.batchRetryDelayMs
+        });
+      }
+      await this.persist();
+      if (this.batchRetryDelayMs) await this.sleep(this.batchRetryDelayMs);
+      pending = retryable;
+    }
+    const preparations = tasks.map((task) => preparationByTask.get(task.id)).filter(Boolean);
+    const failures = tasks.filter((task) => !preparationByTask.has(task.id)).map((task) => {
+      const error = lastErrorByTask.get(task.id);
+      return Object.freeze({
+        id: task.id,
+        state: task.state,
+        error: String(error && error.code || "CARD_BINDING_PREPARE_FAILED"),
+        message: sanitizeText(error && error.message, 200)
+      });
+    });
+    await this.persist();
+    return Object.freeze({
+      stage: "card_binding",
+      mode: "parallel_hosted_prepare",
+      limit: MAX_BATCH_TASKS,
+      requested: tasks.length,
+      generatedProfiles,
+      prepared: preparations.length,
+      maxRetries,
+      retryDelayMs: this.batchRetryDelayMs,
+      retryRounds,
+      retryExecutions,
+      attemptsByTask: tasks.map((task) => ({ id: task.id, attempts: attemptsByTask.get(task.id) || 0 })),
+      preparations: Object.freeze(preparations),
+      failures: Object.freeze(failures),
+      tasks: Object.freeze(tasks.map((task) => this.publicTask(task)))
+    });
+  }
+
+  async completeCardBindingBatch(input = {}) {
+    if (!Array.isArray(input.bindings) || !input.bindings.length) {
+      throw new AppError(400, "CARD_BINDING_BATCH_RESULTS_REQUIRED", "Stripe confirmation results are required.");
+    }
+    if (input.bindings.length > MAX_BATCH_TASKS) {
+      throw new AppError(400, "CARD_BINDING_BATCH_TOO_LARGE", `Concurrent card binding accepts at most ${MAX_BATCH_TASKS} accounts.`);
+    }
+    const maxRetries = this.normalizeBatchRetryCount(input);
+    const ids = input.bindings.map((entry) => String(entry && entry.id || "").trim());
+    const tasks = this.normalizeCardBindingBatchTasks({ ids });
+    const entries = input.bindings.map((binding, index) => ({ binding, task: tasks[index] }));
+    const attemptsByTask = new Map(tasks.map((task) => [task.id, 0]));
+    const completedTaskIds = new Set();
+    const lastErrorByTask = new Map();
+    let pending = [...entries];
+    let retryRounds = 0;
+    let retryExecutions = 0;
+    while (pending.length) {
+      const roundEntries = [...pending];
+      const settled = await Promise.allSettled(roundEntries.map(async ({ binding, task }) => {
+        attemptsByTask.set(task.id, attemptsByTask.get(task.id) + 1);
+        return this.completeCardBinding(task.id, {
+          token: binding.token,
+          setupIntentId: binding.setupIntentId,
+          paymentMethodId: binding.paymentMethodId
+        });
+      }));
+      const retryable = [];
+      for (let index = 0; index < settled.length; index += 1) {
+        const outcome = settled[index];
+        const entry = roundEntries[index];
+        if (outcome.status === "fulfilled") {
+          completedTaskIds.add(entry.task.id);
+        } else {
+          lastErrorByTask.set(entry.task.id, outcome.reason);
+          if (CARD_BINDABLE_STATES.has(entry.task.state)) retryable.push(entry);
+        }
+      }
+      if (!retryable.length || retryRounds >= maxRetries) break;
+      retryRounds += 1;
+      retryExecutions += retryable.length;
+      for (const { task } of retryable) {
+        this.log(task, "warning", `Card-binding verification retry ${retryRounds}/${maxRetries} is scheduled.`, {
+          retryRound: retryRounds,
+          maxRetries,
+          delayMs: this.batchRetryDelayMs
+        });
+      }
+      await this.persist();
+      if (this.batchRetryDelayMs) await this.sleep(this.batchRetryDelayMs);
+      pending = retryable;
+    }
+    const failures = tasks.filter((task) => !completedTaskIds.has(task.id)).map((task) => {
+      const error = lastErrorByTask.get(task.id);
+      return Object.freeze({
+        id: task.id,
+        state: task.state,
+        error: String(error && error.code || "CARD_BINDING_FAILED"),
+        message: sanitizeText(error && error.message, 200)
+      });
+    });
+    await this.persist();
+    return Object.freeze({
+      stage: "card_binding",
+      mode: "parallel_hosted_complete",
+      limit: MAX_BATCH_TASKS,
+      requested: tasks.length,
+      completed: completedTaskIds.size,
+      maxRetries,
+      retryDelayMs: this.batchRetryDelayMs,
+      retryRounds,
+      retryExecutions,
+      attemptsByTask: tasks.map((task) => ({ id: task.id, attempts: attemptsByTask.get(task.id) || 0 })),
+      failures: Object.freeze(failures),
+      tasks: Object.freeze(tasks.map((task) => this.publicTask(task)))
+    });
   }
 
   async create(input = {}) {
@@ -728,6 +995,13 @@ class TaskOrchestrator {
           this.log(task, "success", "The post-binding Checkout was refreshed.");
           await this.persist();
         }
+        if (!task.context.checkout_link || task.context.checkout_link.promotionApplied !== true) {
+          throw new AppError(
+            409,
+            "TRIAL_PROMOTION_NOT_APPLIED",
+            "绑卡后的 Checkout 尚未应用免费优惠；本次未发送订阅确认请求。"
+          );
+        }
         entry.prepared = await adapter.prepare({
           taskId: task.id,
           proxy: entry.proxy,
@@ -943,6 +1217,14 @@ class TaskOrchestrator {
         this.log(task, "success", "绑卡后的活动 Checkout 已刷新");
         await this.persist();
       }
+      if (definition.key === "trial_payment"
+          && (!task.context.checkout_link || task.context.checkout_link.promotionApplied !== true)) {
+        throw new AppError(
+          409,
+          "TRIAL_PROMOTION_NOT_APPLIED",
+          "绑卡后的 Checkout 尚未应用免费优惠；本次未发送订阅确认请求。"
+        );
+      }
       const result = await definition.adapter.execute({
         taskId: task.id,
         proxy,
@@ -1019,6 +1301,7 @@ class TaskOrchestrator {
         campaignId: checkout.campaignId || "",
         promotionApplied: checkout.promotionApplied === true,
         promotionStatus: checkout.promotionStatus || (checkout.promotionApplied === true ? "applied" : "not_offered"),
+        sessionKind: checkout.sessionKind || "",
         route: checkout.route || "",
         proxyFlow: checkout.proxyFlow || [],
         extractedAt: checkout.extractedAt || null

@@ -99,6 +99,37 @@ function upstreamError(stage, status, payload, cloudflareChallenge = false) {
   return new AppError(502, upstreamCode || "CHECKOUT_UPSTREAM_FAILED", `${stage} returned HTTP ${status || "unknown"}.`);
 }
 
+function resolveNavigableCheckout(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const oaicsSessionId = core.extractOpenAICheckoutSessionId(payload);
+  let checkoutUrl = "";
+  let route = "";
+  try {
+    checkoutUrl = core.resolveHostedCheckoutUrl(payload);
+    route = "hosted";
+  } catch {}
+  if (!checkoutUrl && oaicsSessionId) {
+    checkoutUrl = core.buildInternalCheckoutUrl(payload);
+    route = checkoutUrl ? "chatgpt_internal" : "";
+  }
+  if (!checkoutUrl) {
+    checkoutUrl = core.buildClientSecretCheckoutUrl(payload);
+    route = checkoutUrl ? "client_secret" : "";
+  }
+  if (!checkoutUrl) {
+    checkoutUrl = core.buildInternalCheckoutUrl(payload);
+    route = checkoutUrl ? "chatgpt_internal" : "";
+  }
+  if (!checkoutUrl) return null;
+  return Object.freeze({
+    payload,
+    checkoutUrl,
+    route,
+    oaicsSessionId,
+    sessionKind: oaicsSessionId ? "oaics" : "standard"
+  });
+}
+
 class CheckoutProtocolRuntime {
   constructor(options = {}) {
     this.chromium = options.chromium || null;
@@ -230,6 +261,28 @@ class CheckoutProtocolRuntime {
       throw new AppError(502, "CHECKOUT_PAGE_FAILED", `ChatGPT checkout refresh returned HTTP ${response && response.status()}.`);
     }
     return Object.freeze({ status: response.status(), path: target.pathname, refreshed: true });
+  }
+
+  async refreshCurrentPage() {
+    if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
+    await this.ensureChatGptPage();
+    let response;
+    try {
+      response = await this.page.reload({
+        waitUntil: "domcontentloaded",
+        timeout: this.timeoutMs
+      });
+    } catch (error) {
+      throw new AppError(
+        502,
+        "CHECKOUT_PAGE_REFRESH_FAILED",
+        `ChatGPT page refresh failed: ${String(error && error.message || error).slice(0, 220)}`
+      );
+    }
+    if (!response || response.status() >= 400) {
+      throw new AppError(502, "CHECKOUT_PAGE_REFRESH_FAILED", `ChatGPT page refresh returned HTTP ${response && response.status()}.`);
+    }
+    return Object.freeze({ status: response.status(), path: new URL(this.page.url()).pathname, refreshed: true });
   }
 
   async installCheckoutStripeBridge() {
@@ -795,7 +848,7 @@ class CheckoutProtocolRuntime {
         ? await withinDeadline(sdk.timing(), "Sentinel timing")
         : "[1,null]";
       return { token, telemetry };
-    }, { flow: requestedFlow, sdkUrl: SENTINEL_SDK_URL, timeoutMs: Math.min(this.timeoutMs, 25_000) });
+    }, { flow: requestedFlow, sdkUrl: SENTINEL_SDK_URL, timeoutMs: Math.min(this.timeoutMs, 60_000) });
     const token = raw && typeof raw.token === "string" ? raw.token.trim() : "";
     const telemetry = raw && typeof raw.telemetry === "string" ? raw.telemetry.trim() : "";
     if (!token || token.length > 16_384 || telemetry.length > 16_384) {
@@ -857,6 +910,7 @@ class ChatGptCheckoutLinkClient {
         body: core.buildBaselineCheckoutPayload(),
         stage: "US baseline checkout"
       });
+      let fallbackNavigable = resolveNavigableCheckout(baselineCheckout);
       await reportProgress("US 基线 Checkout 已创建，正在切换到 TR 代理");
 
       await runtime.switchProxy("TR", sticky.TR);
@@ -943,9 +997,27 @@ class ChatGptCheckoutLinkClient {
 
       if (!checkout) {
         await reportProgress("同会话更新尚未确认活动，正在生成 Sentinel 结账校验头");
-        const sentinelHeaders = await runtime.acquireSentinelHeaders();
+        let sentinelHeaders = null;
+        let sentinelError = null;
+        for (let sentinelAttempt = 0; sentinelAttempt < 3; sentinelAttempt += 1) {
+          try {
+            sentinelHeaders = await runtime.acquireSentinelHeaders();
+            break;
+          } catch (error) {
+            sentinelError = error;
+            if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
+            if (sentinelAttempt >= 2 || typeof runtime.refreshCurrentPage !== "function") break;
+            await reportProgress(`Sentinel 尚未加载，20 秒后仅刷新当前提链页并重试（${sentinelAttempt + 1}/2）`);
+            if (typeof runtime.waitForRetry === "function") await runtime.waitForRetry(20_000);
+            else await new Promise((resolve) => setTimeout(resolve, 20_000));
+            await runtime.refreshCurrentPage();
+          }
+        }
+        if (!sentinelHeaders) {
+          throw sentinelError || new AppError(502, "CHECKOUT_SENTINEL_INVALID", "Sentinel headers are unavailable.");
+        }
         const attempts = [
-          core.buildPhShortPromotionPayload({ campaignId }),
+          core.buildShortPromotionPayload({ campaignId }),
           core.buildPromotionCheckoutPayload({ campaignId, oneClickTrial: false })
         ];
         for (const [attemptIndex, body] of attempts.entries()) {
@@ -966,6 +1038,8 @@ class ChatGptCheckoutLinkClient {
           }
           const candidateOaics = core.extractOpenAICheckoutSessionId(candidate);
           const candidateApplied = core.hasAppliedPromotion(candidate);
+          const navigableCandidate = resolveNavigableCheckout(candidate);
+          if (!fallbackNavigable && navigableCandidate) fallbackNavigable = navigableCandidate;
           if (candidateOaics) {
             fallbackCheckout = { ...candidate, checkout_session_id: candidateOaics, processor_entity: "openai_llc" };
             fallbackOaics = candidateOaics;
@@ -989,19 +1063,23 @@ class ChatGptCheckoutLinkClient {
         oaicsSessionId = fallbackOaics;
         await reportProgress("当前账号未检测到活动资格，已保留可导航的 OAICS 结账链接");
       }
-      if (!checkout || !oaicsSessionId) throw new AppError(502, "CHECKOUT_SESSION_ID_MISSING", "Checkout response did not include an OAICS session.");
-      core.requireOpenAICheckoutSession(checkout);
-      const promotionApplied = core.hasAppliedPromotion(checkout);
-
-      let checkoutUrl = "";
-      let route = "hosted";
-      try {
-        checkoutUrl = core.resolveHostedCheckoutUrl(checkout);
-      } catch {
-        checkoutUrl = core.buildInternalCheckoutUrl(checkout) || core.buildClientSecretCheckoutUrl(checkout);
-        route = checkoutUrl.includes("/checkout/") ? "chatgpt_internal" : "client_secret";
+      let resolved = checkout ? resolveNavigableCheckout(checkout) : fallbackNavigable;
+      if (!resolved) throw new AppError(502, "CHECKOUT_URL_MISSING", "Checkout response did not include a navigable URL.");
+      if (!checkout) {
+        checkout = resolved.payload;
+        oaicsSessionId = resolved.oaicsSessionId;
+        await reportProgress("优惠尚未挂载，已保留普通结账链接供绑卡；绑卡后将重新校验活动资格");
       }
-      if (!checkoutUrl) throw new AppError(502, "CHECKOUT_URL_MISSING", "Checkout response did not include a navigable URL.");
+      const promotionApplied = core.hasAppliedPromotion(checkout);
+      resolved = resolveNavigableCheckout(checkout) || resolved;
+      const checkoutUrl = resolved.checkoutUrl;
+      const route = resolved.route;
+      const sessionKind = resolved.sessionKind;
+      const promotionStatus = promotionApplied
+        ? "applied"
+        : accountContext.eligibleCampaignIds.length > 0 && paymentPreflight.oneClickTrialEligible === false
+          ? "pending_payment_method"
+          : "not_offered";
 
       await runtime.saveSession(session.path);
       await reportProgress("US → TR 提链完成，结账链接已写入当前任务");
@@ -1009,8 +1087,8 @@ class ChatGptCheckoutLinkClient {
         checkoutUrl,
         campaignId,
         promotionApplied,
-        promotionStatus: promotionApplied ? "applied" : "not_offered",
-        sessionKind: "oaics",
+        promotionStatus,
+        sessionKind,
         route,
         proxyFlow: Object.freeze(["US", "TR"]),
         account: Object.freeze({

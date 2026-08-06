@@ -1,9 +1,15 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const { AppError } = require("../lib/errors");
 const { requestTextThroughProxy } = require("../lib/proxy-request");
 
-const ALLOWED_MAILBOX_HOSTS = new Set(["mail.ai1998.xyz"]);
+const ALLOWED_MAILBOX_HOSTS = new Set(["mail.ai1998.xyz", "icloud.biubiu007.com", "icloud-api.top"]);
+const MAILBOX_PROVIDER = Object.freeze({
+  "mail.ai1998.xyz": "messages_path",
+  "icloud.biubiu007.com": "open_php",
+  "icloud-api.top": "share_path"
+});
 
 function decodeHtml(text) {
   const named = {
@@ -23,7 +29,8 @@ function decodeHtml(text) {
 }
 
 function visibleText(html) {
-  return decodeHtml(String(html || "")
+  const decoded = decodeHtml(String(html || ""));
+  return decodeHtml(decoded
     .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
     .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
     .replace(/<br\s*\/?\s*>/gi, "\n")
@@ -37,6 +44,16 @@ function maskEmail(email) {
   if (!local || !domain) return "[email]";
   const shown = local.length <= 2 ? local[0] : local.slice(0, 2);
   return `${shown}${"*".repeat(Math.max(3, Math.min(8, local.length - shown.length)))}@${domain}`;
+}
+
+function rotateMailboxProxySession(proxy) {
+  if (!proxy || typeof proxy !== "object") return proxy;
+  const password = String(proxy.password || "");
+  const match = password.match(/-([A-Z]{2})(?:-[A-Za-z0-9]{8})?$/i);
+  if (!match) return proxy;
+  const suffix = `-${match[1].toUpperCase()}-${crypto.randomBytes(4).toString("hex")}`;
+  const nextPassword = password.replace(/-[A-Z]{2}(?:-[A-Za-z0-9]{8})?$/i, suffix);
+  return Object.freeze({ ...proxy, password: nextPassword });
 }
 
 function parseAccountLine(value) {
@@ -71,22 +88,59 @@ function normalizeMailboxInput(input = {}) {
   if (!ALLOWED_MAILBOX_HOSTS.has(hostname)) {
     throw new AppError(400, "MAILBOX_HOST_NOT_ALLOWED", "Mailbox URL host is not configured for this adapter.");
   }
-  const pathParts = inboxUrl.pathname.split("/").filter(Boolean);
-  if (pathParts.length !== 3 || pathParts[0] !== "messages" || pathParts[1].length < 8) {
-    throw new AppError(400, "INVALID_MAILBOX_PATH", "Mailbox URL path does not match the message platform contract.");
+  const provider = MAILBOX_PROVIDER[hostname];
+  if (provider === "messages_path") {
+    const pathParts = inboxUrl.pathname.split("/").filter(Boolean);
+    if (pathParts.length !== 3 || pathParts[0] !== "messages" || pathParts[1].length < 8) {
+      throw new AppError(400, "INVALID_MAILBOX_PATH", "Mailbox URL path does not match the message platform contract.");
+    }
+    let pathEmail;
+    try {
+      pathEmail = decodeURIComponent(pathParts[2]).toLowerCase();
+    } catch {
+      throw new AppError(400, "INVALID_MAILBOX_PATH", "Mailbox URL contains an invalid encoded address.");
+    }
+    if (pathEmail !== email) {
+      throw new AppError(400, "MAILBOX_EMAIL_MISMATCH", "Mailbox URL and iCloud address do not match.");
+    }
+    inboxUrl.search = "";
+    inboxUrl.searchParams.set("all", "1");
+  } else if (provider === "open_php") {
+    if (inboxUrl.pathname !== "/console/open.php") {
+      throw new AppError(400, "INVALID_MAILBOX_PATH", "Mailbox URL path does not match the open.php contract.");
+    }
+    const queryEmail = String(inboxUrl.searchParams.get("mail") || "").trim().toLowerCase();
+    const password = String(inboxUrl.searchParams.get("pwd") || "");
+    const limit = String(inboxUrl.searchParams.get("limit") || "1");
+    if (queryEmail !== email) {
+      throw new AppError(400, "MAILBOX_EMAIL_MISMATCH", "Mailbox URL and iCloud address do not match.");
+    }
+    if (!password || password.length > 512 || /[\u0000-\u001f\u007f]/.test(password)) {
+      throw new AppError(400, "INVALID_MAILBOX_CREDENTIAL", "Mailbox URL contains an invalid pwd value.");
+    }
+    if (!/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 100) {
+      throw new AppError(400, "INVALID_MAILBOX_LIMIT", "Mailbox URL limit must be between 1 and 100.");
+    }
+    inboxUrl.searchParams.set("limit", limit);
+  } else if (provider === "share_path") {
+    const pathParts = inboxUrl.pathname.split("/").filter(Boolean);
+    if (pathParts.length !== 3 || pathParts[0] !== "s" || !/^[A-Za-z0-9_-]{16,256}$/.test(pathParts[1])) {
+      throw new AppError(400, "INVALID_MAILBOX_PATH", "Mailbox URL path does not match the share-path contract.");
+    }
+    let pathEmail;
+    try {
+      pathEmail = decodeURIComponent(pathParts[2]).toLowerCase();
+    } catch {
+      throw new AppError(400, "INVALID_MAILBOX_PATH", "Mailbox URL contains an invalid encoded address.");
+    }
+    if (pathEmail !== email) {
+      throw new AppError(400, "MAILBOX_EMAIL_MISMATCH", "Mailbox URL and iCloud address do not match.");
+    }
+    if (inboxUrl.search) {
+      throw new AppError(400, "INVALID_MAILBOX_URL", "Share-path mailbox URLs must not contain query parameters.");
+    }
   }
-  let pathEmail;
-  try {
-    pathEmail = decodeURIComponent(pathParts[2]).toLowerCase();
-  } catch {
-    throw new AppError(400, "INVALID_MAILBOX_PATH", "Mailbox URL contains an invalid encoded address.");
-  }
-  if (pathEmail !== email) {
-    throw new AppError(400, "MAILBOX_EMAIL_MISMATCH", "Mailbox URL and iCloud address do not match.");
-  }
-  inboxUrl.search = "";
-  inboxUrl.searchParams.set("all", "1");
-  return Object.freeze({ email, inboxUrl: inboxUrl.href, mailboxHost: hostname });
+  return Object.freeze({ email, inboxUrl: inboxUrl.href, mailboxHost: hostname, mailboxProvider: provider });
 }
 
 function extractVerificationCode(text) {
@@ -103,7 +157,42 @@ function extractVerificationCode(text) {
 
 function parseMailboxPage(html) {
   const source = String(html || "");
-  const text = visibleText(source);
+  let json = null;
+  try { json = JSON.parse(source); } catch {}
+  const jsonStrings = [];
+  const jsonCounts = [];
+  const jsonMessageArrays = [];
+  const jsonTimes = [];
+  if (json && typeof json === "object") {
+    const queue = [{ value: json, key: "root", depth: 0 }];
+    let inspected = 0;
+    while (queue.length && inspected < 1000) {
+      const { value, key, depth } = queue.shift();
+      inspected += 1;
+      if (typeof value === "string") {
+        jsonStrings.push(value);
+        if (/(?:time|date|created|received|sent|timestamp)/i.test(key)) {
+          const parsed = Date.parse(value);
+          if (Number.isFinite(parsed)) jsonTimes.push(parsed);
+        }
+        continue;
+      }
+      if (typeof value === "number" && /^(?:count|total|total_count|message_count)$/i.test(key)
+          && Number.isInteger(value) && value >= 0 && value <= 100000) {
+        jsonCounts.push(value);
+      }
+      if (!value || typeof value !== "object" || depth >= 8) continue;
+      if (Array.isArray(value) && /(?:mail|message|list|data|record|result)/i.test(key)) {
+        jsonMessageArrays.push(value.length);
+      }
+      for (const [childKey, child] of Object.entries(value)) {
+        if (child && typeof child === "object" || typeof child === "string" || typeof child === "number") {
+          queue.push({ value: child, key: childKey, depth: depth + 1 });
+        }
+      }
+    }
+  }
+  const text = jsonStrings.length ? visibleText(jsonStrings.join(" ")) : visibleText(source);
   const countMatch = text.match(/(?:本页显示|page shows?)\s*(\d+)\s*(?:封|messages?)/i);
   const articleCount = (source.match(/<article\b/gi) || []).length;
   const cardCount = (source.match(/class=["'][^"']*\bmail-card\b[^"']*["']/gi) || []).length;
@@ -111,12 +200,15 @@ function parseMailboxPage(html) {
     .map((match) => Date.parse(match[1]))
     .filter(Number.isFinite);
   const code = extractVerificationCode(text);
+  const detectedCount = Math.max(0, ...jsonCounts, ...jsonMessageArrays, articleCount, cardCount);
+  const messageCount = countMatch ? Number(countMatch[1]) : detectedCount;
+  const allTimes = [...timeMatches, ...jsonTimes];
   return Object.freeze({
-    messageCount: countMatch ? Number(countMatch[1]) : Math.max(articleCount, cardCount),
-    empty: /(?:暂无邮件|no messages?)/i.test(text),
+    messageCount,
+    empty: /(?:暂无邮件|no messages?|empty mailbox)/i.test(text) || messageCount === 0,
     verificationCode: code,
     codeAvailable: Boolean(code),
-    latestMessageAt: timeMatches.length ? new Date(Math.max(...timeMatches)).toISOString() : null
+    latestMessageAt: allTimes.length ? new Date(Math.max(...allTimes)).toISOString() : null
   });
 }
 
@@ -124,6 +216,7 @@ function publicMailboxSnapshot(config, snapshot) {
   return Object.freeze({
     account: maskEmail(config.email),
     mailboxHost: config.mailboxHost,
+    mailboxProvider: config.mailboxProvider,
     messageCount: snapshot.messageCount,
     empty: snapshot.empty,
     codeAvailable: snapshot.codeAvailable,
@@ -142,10 +235,29 @@ class MailboxCodeReader {
   async fetchSnapshot(input = {}) {
     const config = normalizeMailboxInput(input);
     const requestText = typeof input.requestText === "function" ? input.requestText : this.requestText;
-    const response = await requestText(config.inboxUrl, input.proxy, {
-      timeoutMs: input.timeoutMs || 20_000,
-      maxBytes: 2 * 1024 * 1024
-    });
+    let response = null;
+    let lastError = null;
+    const attempts = Math.max(1, Math.min(Number(input.requestAttempts) || 3, 3));
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        response = await requestText(config.inboxUrl, rotateMailboxProxySession(input.proxy), {
+          timeoutMs: input.timeoutMs || 20_000,
+          maxBytes: 2 * 1024 * 1024
+        });
+        const status = Number(response && response.status) || 0;
+        if ((status === 429 || status >= 500) && attempt + 1 < attempts) {
+          await this.sleep(1_500 * (attempt + 1));
+          continue;
+        }
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt + 1 < attempts) await this.sleep(1_500 * (attempt + 1));
+      }
+    }
+    if (!response) {
+      throw new AppError(502, "MAILBOX_NETWORK_ERROR", "Mailbox network request failed after bounded retries.", lastError);
+    }
     if (response.status !== 200) {
       throw new AppError(502, "MAILBOX_HTTP_ERROR", `Mailbox platform returned HTTP ${response.status}.`);
     }
@@ -154,6 +266,7 @@ class MailboxCodeReader {
       ...parsed,
       email: config.email,
       mailboxHost: config.mailboxHost,
+      mailboxProvider: config.mailboxProvider,
       checkedAt: this.now().toISOString()
     });
   }
@@ -173,28 +286,49 @@ class MailboxCodeReader {
     const afterMessageCount = hasMessageBaseline ? Number(input.afterMessageCount) : null;
     const parsedLatestBaseline = Date.parse(String(input.afterLatestMessageAt || ""));
     const hasLatestBaseline = Number.isFinite(parsedLatestBaseline);
+    const hasCodeBaseline = Object.hasOwn(input, "afterVerificationCode");
+    const afterVerificationCode = hasCodeBaseline ? String(input.afterVerificationCode || "") : "";
     const deadline = Date.now() + timeoutMs;
+    let successfulSnapshots = 0;
+    let lastTransientError = null;
     do {
-      const snapshot = await this.fetchSnapshot({
-        ...config,
-        proxy: input.proxy,
-        requestText: input.requestText,
-        timeoutMs: Math.min(20_000, timeoutMs)
-      });
-      const parsedLatest = Date.parse(String(snapshot.latestMessageAt || ""));
-      const isFresh = (!hasMessageBaseline && !hasLatestBaseline)
-        || (hasMessageBaseline && snapshot.messageCount > afterMessageCount)
-        || (hasLatestBaseline && Number.isFinite(parsedLatest) && parsedLatest > parsedLatestBaseline);
-      if (snapshot.verificationCode && isFresh) return snapshot.verificationCode;
+      try {
+        const snapshot = await this.fetchSnapshot({
+          ...config,
+          proxy: input.proxy,
+          requestText: input.requestText,
+          timeoutMs: Math.min(20_000, timeoutMs)
+        });
+        successfulSnapshots += 1;
+        lastTransientError = null;
+        const parsedLatest = Date.parse(String(snapshot.latestMessageAt || ""));
+        const isFresh = (!hasMessageBaseline && !hasLatestBaseline && !hasCodeBaseline)
+          || (hasMessageBaseline && snapshot.messageCount > afterMessageCount)
+          || (hasLatestBaseline && Number.isFinite(parsedLatest) && parsedLatest > parsedLatestBaseline)
+          || (hasCodeBaseline && snapshot.verificationCode && snapshot.verificationCode !== afterVerificationCode);
+        if (snapshot.verificationCode && isFresh) return snapshot.verificationCode;
+      } catch (error) {
+        if (!["MAILBOX_HTTP_ERROR", "MAILBOX_NETWORK_ERROR"].includes(error && error.code)) throw error;
+        lastTransientError = error;
+      }
       if (Date.now() >= deadline) break;
       await this.sleep(Math.min(pollIntervalMs, deadline - Date.now()));
     } while (Date.now() <= deadline);
+    if (!successfulSnapshots && lastTransientError) {
+      throw new AppError(
+        502,
+        "MAILBOX_UNAVAILABLE_AFTER_RETRIES",
+        "Mailbox platform remained unavailable throughout bounded polling.",
+        lastTransientError
+      );
+    }
     throw new AppError(504, "VERIFICATION_CODE_TIMEOUT", "No verification code arrived before the polling deadline.");
   }
 }
 
 module.exports = {
   ALLOWED_MAILBOX_HOSTS,
+  MAILBOX_PROVIDER,
   MailboxCodeReader,
   extractVerificationCode,
   maskEmail,
@@ -202,5 +336,6 @@ module.exports = {
   parseAccountLine,
   parseMailboxPage,
   publicMailboxSnapshot,
+  rotateMailboxProxySession,
   visibleText
 };

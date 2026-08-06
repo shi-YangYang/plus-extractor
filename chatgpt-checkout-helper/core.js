@@ -64,17 +64,25 @@
   function buildCheckoutPayload({
     promotion = true,
     oneClickTrial = true,
-    campaignId = CHECKOUT_CONFIG.campaignId
+    campaignId = CHECKOUT_CONFIG.campaignId,
+    country = CHECKOUT_CONFIG.countryCode,
+    currency = CHECKOUT_CONFIG.currency
   } = {}) {
     const normalizedCampaignId = typeof campaignId === "string" && campaignId.trim()
       ? campaignId.trim()
       : CHECKOUT_CONFIG.campaignId;
+    const normalizedCountry = /^[A-Z]{2}$/.test(String(country || "").trim().toUpperCase())
+      ? String(country).trim().toUpperCase()
+      : CHECKOUT_CONFIG.countryCode;
+    const normalizedCurrency = /^[A-Z]{3}$/.test(String(currency || "").trim().toUpperCase())
+      ? String(currency).trim().toUpperCase()
+      : CHECKOUT_CONFIG.currency;
     const payload = {
       entry_point: CHECKOUT_CONFIG.entryPoint,
       plan_name: CHECKOUT_CONFIG.planName,
       billing_details: {
-        country: CHECKOUT_CONFIG.countryCode,
-        currency: CHECKOUT_CONFIG.currency
+        country: normalizedCountry,
+        currency: normalizedCurrency
       },
       cancel_url: promotion
         ? `https://chatgpt.com/?promo_campaign=${encodeURIComponent(normalizedCampaignId)}#pricing`
@@ -93,17 +101,28 @@
   }
 
   function buildBaselineCheckoutPayload() {
-    return buildCheckoutPayload({ promotion: false, oneClickTrial: false });
+    return buildCheckoutPayload({
+      promotion: false,
+      oneClickTrial: false,
+      country: "US",
+      currency: "USD"
+    });
   }
 
   function buildPromotionCheckoutPayload({
     oneClickTrial = true,
     campaignId = CHECKOUT_CONFIG.campaignId
   } = {}) {
-    return buildCheckoutPayload({ promotion: true, oneClickTrial, campaignId });
+    return buildCheckoutPayload({
+      promotion: true,
+      oneClickTrial,
+      campaignId,
+      country: "TR",
+      currency: "USD"
+    });
   }
 
-  function buildPhShortPromotionPayload({ campaignId = CHECKOUT_CONFIG.campaignId } = {}) {
+  function buildShortPromotionPayload({ campaignId = CHECKOUT_CONFIG.campaignId } = {}) {
     const normalizedCampaignId = typeof campaignId === "string" && campaignId.trim()
       ? campaignId.trim()
       : CHECKOUT_CONFIG.campaignId;
@@ -111,8 +130,8 @@
       entry_point: CHECKOUT_CONFIG.entryPoint,
       plan_name: CHECKOUT_CONFIG.planName,
       billing_details: {
-        country: CHECKOUT_CONFIG.countryCode,
-        currency: CHECKOUT_CONFIG.currency
+        country: "TR",
+        currency: "USD"
       },
       promo_campaign: {
         promo_campaign_id: normalizedCampaignId,
@@ -120,6 +139,8 @@
       }
     };
   }
+
+  const buildPhShortPromotionPayload = buildShortPromotionPayload;
 
   function buildPromotionUpdatePayload({
     checkoutSessionId,
@@ -875,6 +896,7 @@
     buildCheckoutPayload,
     buildBaselineCheckoutPayload,
     buildPromotionCheckoutPayload,
+    buildShortPromotionPayload,
     buildPhShortPromotionPayload,
     buildPromotionUpdatePayload,
     getSessionAccountId,

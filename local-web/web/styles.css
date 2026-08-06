@@ -204,6 +204,13 @@ textarea::placeholder { color: #536d64; }
 .batch-retry-control input { width: 58px; border: 0; border-left: 1px solid var(--border); background: transparent; color: var(--text); padding: 7px 4px 7px 10px; text-align: center; }
 .batch-limit-note { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .account-batch-message { grid-column: 1 / -1; min-height: 16px; }
+.shared-card-binding-section { display: grid; gap: 12px; margin: 14px 0; border: 1px solid rgba(121,184,255,.24); border-radius: 18px; background: linear-gradient(145deg, rgba(17,45,39,.92), rgba(5,19,16,.97)); padding: 17px; box-shadow: 0 18px 42px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.03); }
+.shared-card-binding-section .shared-card-binding-header h3 { margin: 4px 0 5px; font-size: 17px; }
+.shared-card-binding-section .shared-card-binding-header p:last-child { margin: 0; color: var(--muted); font-size: 10px; }
+.standalone-payment-card { max-width: 760px; width: 100%; justify-self: center; }
+.shared-card-binding-section[data-state="ready"] { border-color: rgba(55,230,161,.35); }
+.shared-card-binding-section[data-state="running"] { border-color: rgba(255,191,92,.4); }
+.shared-card-binding-section[data-state="error"] { border-color: rgba(255,104,104,.42); }
 
 .pipeline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .stage { position: relative; min-height: 146px; border: 1px solid var(--border); border-radius: 14px; background: rgba(3, 16, 12, 0.38); padding: 14px; }
@@ -272,10 +279,7 @@ textarea::placeholder { color: #536d64; }
 .trial-subscription-result h4 { margin: 0; color: var(--green); font-size: 13px; }
 .trial-subscription-result p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .trial-subscription-result code { overflow-wrap: anywhere; padding: 8px 9px; border: 1px solid rgba(55,230,161,.18); border-radius: 8px; background: rgba(2,12,9,.65); color: #d9fff0; font-size: 10px; }
-.card-binding-panel { display: grid; gap: 11px; border: 1px solid rgba(121,184,255,.24); border-radius: 15px; background: linear-gradient(145deg, rgba(17,45,39,.92), rgba(5,19,16,.96)); padding: 14px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
-.card-binding-panel.unavailable { opacity: .72; }
-.card-binding-panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.card-binding-panel-header h5 { margin: 0; color: var(--text); font-size: 15px; }
+.shared-card-binding-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .card-binding-privacy { margin: 14px 0; border-left: 3px solid var(--green); padding-left: 10px; color: var(--muted); font-size: 11px; line-height: 1.55; }
 .payment-card-visual { display: grid; gap: 18px; min-height: 190px; border: 1px solid rgba(121,184,255,.28); border-radius: 18px; background: radial-gradient(circle at 85% 10%, rgba(121,184,255,.22), transparent 45%), linear-gradient(135deg, #183f37, #0b211c 65%, #071713); padding: 18px; box-shadow: 0 16px 38px rgba(0,0,0,.22); }
 .payment-card-topline { display: flex; align-items: center; justify-content: space-between; color: #bcd0c9; font-size: 9px; letter-spacing: .13em; }

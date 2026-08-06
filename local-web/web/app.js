@@ -13,6 +13,11 @@ const FAILURE_SELECTION_GROUPS = Object.freeze([
     states: Object.freeze(["CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED"])
   }),
   Object.freeze({
+    stage: "card_binding",
+    label: "绑卡失败",
+    states: Object.freeze(["CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED"])
+  }),
+  Object.freeze({
     stage: "trial_payment",
     label: "订阅失败",
     states: Object.freeze(["TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"])
@@ -60,7 +65,15 @@ const elements = {
   batchRetryCount: document.querySelector("#batch-retry-count"),
   batchRegisterButton: document.querySelector("#batch-register-button"),
   batchExtractButton: document.querySelector("#batch-extract-button"),
+  batchCardProfileButton: document.querySelector("#batch-card-profile-button"),
+  batchCardBindButton: document.querySelector("#batch-card-bind-button"),
   batchSubscribeButton: document.querySelector("#batch-subscribe-button"),
+  sharedCardSection: document.querySelector("#shared-card-binding-section"),
+  sharedCardCount: document.querySelector("#shared-card-binding-count"),
+  sharedCardMount: document.querySelector("#shared-stripe-card"),
+  sharedCardMessage: document.querySelector("#shared-card-binding-message"),
+  sharedCardReload: document.querySelector("#batch-card-reload"),
+  sharedCardSubmit: document.querySelector("#batch-card-submit"),
   toast: document.querySelector("#toast")
 };
 
@@ -207,7 +220,8 @@ function updateExportControls() {
   const ids = new Set(tasks.map((task) => task.id));
   state.selectedExportTaskIds = new Set([...state.selectedExportTaskIds].filter((id) => ids.has(id)));
   const count = state.selectedExportTaskIds.size;
-  const concurrencyReady = count > 0 && count <= 10 && !state.batchRunning;
+  const cardSessionActive = Boolean(state.cardBindingSession);
+  const concurrencyReady = count > 0 && count <= 10 && !state.batchRunning && !cardSessionActive;
   const selectedTasks = tasks.filter((task) => state.selectedExportTaskIds.has(task.id));
   const everySelectedIn = (states) => selectedTasks.length === count
     && selectedTasks.every((task) => states.includes(task.state));
@@ -217,14 +231,22 @@ function updateExportControls() {
   const retryLimit = Number(state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.maxRetries) || 10;
   elements.batchRetryCount.max = String(retryLimit);
   elements.exportCount.textContent = `已选择 ${count} 个账号${count > 10 ? " · 并发批次最多 10 个" : ""}`;
-  elements.exportAccountsButton.disabled = count === 0 || state.batchRunning;
-  elements.selectFailedButton.disabled = !hasRetryableFailures || state.batchRunning;
-  elements.batchRetryCount.disabled = state.batchRunning;
+  elements.exportAccountsButton.disabled = count === 0 || state.batchRunning || cardSessionActive;
+  elements.selectFailedButton.disabled = !hasRetryableFailures || state.batchRunning || cardSessionActive;
+  elements.batchRetryCount.disabled = state.batchRunning || cardSessionActive;
   elements.batchRegisterButton.disabled = !concurrencyReady || !everySelectedIn(["QUEUED", "REGISTERING_BLOCKED", "REGISTRATION_BLOCKED", "REGISTRATION_FAILED"]);
   elements.batchExtractButton.disabled = !concurrencyReady || !everySelectedIn(["REGISTERED", "CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED"]);
+  elements.batchCardProfileButton.disabled = !concurrencyReady || !everySelectedIn(["CHECKOUT_LINK_READY", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"]);
+  elements.batchCardBindButton.disabled = !concurrencyReady || !everySelectedIn(["CHECKOUT_LINK_READY", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"]);
   elements.batchSubscribeButton.disabled = !concurrencyReady || !everySelectedIn(["CARD_BOUND", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"]);
+  elements.exportSelectAll.disabled = state.batchRunning || cardSessionActive;
   elements.exportSelectAll.checked = tasks.length > 0 && count === tasks.length;
   elements.exportSelectAll.indeterminate = count > 0 && count < tasks.length;
+  if (!cardSessionActive) {
+    elements.sharedCardCount.textContent = count
+      ? `已选择 ${count} 个账号；完成提链的账号可以共用下方卡片并发绑定。`
+      : "选择 1–10 个已完成提链的账号，然后点击“并发绑卡”。";
+  }
 }
 
 function renderTasks() {
@@ -251,6 +273,7 @@ function renderTasks() {
     selection.type = "checkbox";
     selection.className = "task-export-checkbox";
     selection.checked = state.selectedExportTaskIds.has(task.id);
+    selection.disabled = state.batchRunning || Boolean(state.cardBindingSession);
     selection.setAttribute("aria-label", `选择账号 ${task.account && task.account.account || task.id} 用于批量操作`);
     selection.addEventListener("change", () => {
       if (selection.checked) state.selectedExportTaskIds.add(task.id);
@@ -273,8 +296,7 @@ function renderTasks() {
     time.textContent = `${task.account && task.account.account ? `${task.account.account} · ` : ""}${new Date(task.updatedAt).toLocaleString()}`;
     top.append(id, status);
     button.append(top, time);
-    button.addEventListener("click", async () => {
-      await disposeCardBindingPanel();
+    button.addEventListener("click", () => {
       state.selectedTaskId = task.id;
       renderTasks();
     });
@@ -314,16 +336,19 @@ function renderTaskDetail() {
   run.className = "button primary";
   const hostedCardInputRequired = ["CHECKOUT_LINK_READY", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED"].includes(task.state);
   const trialRunnable = ["CARD_BOUND", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"].includes(task.state);
-  const trialReady = Boolean(
+  const trialAdapterReady = Boolean(
     state.bootstrap
     && state.bootstrap.adapters
     && state.bootstrap.adapters.trialPayment
     && state.bootstrap.adapters.trialPayment.ready
-    && task.checkoutLink
-    && task.checkoutLink.promotionApplied === true
   );
+  const promotionPending = trialRunnable
+    && task.checkoutLink
+    && task.checkoutLink.promotionApplied !== true;
   run.textContent = trialRunnable
-    ? (task.state === "CARD_BOUND" ? "一键订阅" : "重新尝试一键订阅")
+    ? (promotionPending
+      ? "刷新优惠资格"
+      : (task.state === "CARD_BOUND" ? "一键订阅" : "重新尝试一键订阅"))
     : hostedCardInputRequired
     ? (task.cardProfile ? "请使用下方开始绑卡" : "请先生成绑卡资料")
     : task.state.includes("BLOCKED") || task.state.includes("FAILED")
@@ -336,7 +361,7 @@ function renderTaskDetail() {
     || task.state === "BINDING_CARD"
     || task.state === "REQUESTING_TRIAL"
     || hostedCardInputRequired
-    || (trialRunnable && !trialReady);
+    || (trialRunnable && !trialAdapterReady);
   run.addEventListener("click", () => trialRunnable ? subscribeTrial(task, run) : runTask(task.id, run));
 
   const remove = document.createElement("button");
@@ -378,15 +403,22 @@ function renderTaskDetail() {
     const checkoutHeading = document.createElement("h4");
     checkoutHeading.textContent = "已提取结账链接";
     const promotionEligible = task.checkoutLink.promotionApplied === true;
+    const promotionPending = task.checkoutLink.promotionStatus === "pending_payment_method";
     const eligibilityLabel = document.createElement("span");
     eligibilityLabel.className = `promotion-eligibility-label ${promotionEligible ? "eligible" : "not-eligible"}`;
-    eligibilityLabel.textContent = promotionEligible ? "有优惠资格" : "无优惠资格";
+    eligibilityLabel.textContent = promotionEligible
+      ? "有优惠资格"
+      : promotionPending
+        ? "待绑卡后复核"
+        : "无优惠资格";
     checkoutHeader.append(checkoutHeading, eligibilityLabel);
     const checkoutMeta = document.createElement("p");
     const flow = Array.isArray(task.checkoutLink.proxyFlow) ? task.checkoutLink.proxyFlow.join(" → ") : "US → TR";
     const promotion = task.checkoutLink.promotionApplied
       ? `${task.checkoutLink.campaignId || "活动"} 已应用`
-      : "当前账号未检测到活动资格";
+      : promotionPending
+        ? "普通链接已就绪，绑卡后重新校验活动"
+        : "当前账号未检测到活动资格";
     checkoutMeta.textContent = `${flow} · ${promotion} · ${task.checkoutLink.route || "checkout"}`;
     const checkoutCode = document.createElement("code");
     checkoutCode.textContent = task.checkoutLink.url;
@@ -436,6 +468,18 @@ function renderTaskDetail() {
     const profileActions = document.createElement("div");
     profileActions.className = "card-profile-actions";
     profileActions.append(generateButton);
+    if (["CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED"].includes(task.state)) {
+      const retryCardButton = document.createElement("button");
+      retryCardButton.type = "button";
+      retryCardButton.className = "button primary card-binding-retry-button";
+      retryCardButton.textContent = "重试绑卡";
+      retryCardButton.addEventListener("click", async () => {
+        state.selectedExportTaskIds = new Set([task.id]);
+        renderTasks();
+        await startBatchCardBinding([task.id]);
+      });
+      profileActions.append(retryCardButton);
+    }
     const canRebindAfterTrialBlock = ["TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"].includes(task.state);
     profileHeader.append(profileHeading, profileActions);
     cardProfileResult.append(profileHeader);
@@ -478,11 +522,11 @@ function renderTaskDetail() {
       profileEmpty.textContent = "按参考 JSON 随机抽取一组相互匹配的姓名、邮编和完整地址。";
       cardProfileResult.append(profileEmpty);
     }
-    const showCardInput = task.state !== "ABANDONED" && (!task.cardBinding || canRebindAfterTrialBlock);
-    if (showCardInput) {
-      const cardPanel = createCardBindingPanel(task);
-      cardProfileResult.append(cardPanel.root);
-      if (task.cardProfile) queueMicrotask(() => initializeCardBindingPanel(task, cardPanel));
+    if (task.state !== "ABANDONED" && (!task.cardBinding || canRebindAfterTrialBlock)) {
+      const sharedNotice = document.createElement("p");
+      sharedNotice.className = "card-binding-privacy";
+      sharedNotice.textContent = "卡片输入已独立到账号列表上方；勾选 1–10 个账号后使用“并发绑卡”。";
+      cardProfileResult.append(sharedNotice);
     }
   }
 
@@ -678,13 +722,16 @@ async function runTask(taskId, button) {
 }
 
 async function subscribeTrial(task, button) {
+  const promotionPending = task.checkoutLink && task.checkoutLink.promotionApplied !== true;
   const confirmed = window.confirm(
-    "确认使用已绑定的默认支付方式订阅 ChatGPT Plus？当前优惠首月应付为 0；试用结束后将按结账页价格自动续费，除非提前取消。"
+    promotionPending
+      ? "确认刷新绑卡后的优惠资格？系统只会在免费优惠已应用且当前应付为 0 时发送订阅请求。"
+      : "确认使用已绑定的默认支付方式订阅 ChatGPT Plus？当前优惠首月应付为 0；试用结束后将按结账页价格自动续费，除非提前取消。"
   );
   if (!confirmed) return;
 
   button.disabled = true;
-  button.textContent = "正在更新账单并订阅…";
+  button.textContent = promotionPending ? "正在刷新并校验优惠…" : "正在更新账单并订阅…";
   try {
     await api(`/api/tasks/${task.id}/run`, {
       method: "POST",
@@ -712,7 +759,7 @@ async function deleteTask(taskId, button) {
   button.disabled = true;
   button.textContent = "删除中…";
   try {
-    if (state.cardBindingSession && state.cardBindingSession.taskId === taskId) await disposeCardBindingPanel();
+    if (state.cardBindingSession && state.cardBindingSession.taskIds.includes(taskId)) await disposeCardBindingPanel();
     await api(`/api/tasks/${taskId}`, { method: "DELETE" });
     if (state.bootstrap && Array.isArray(state.bootstrap.tasks)) {
       state.bootstrap.tasks = state.bootstrap.tasks.filter((candidate) => candidate.id !== taskId);
@@ -737,7 +784,7 @@ async function abandonTask(taskId, button) {
   button.disabled = true;
   button.textContent = "处理中…";
   try {
-    if (state.cardBindingSession && state.cardBindingSession.taskId === taskId) await disposeCardBindingPanel();
+    if (state.cardBindingSession && state.cardBindingSession.taskIds.includes(taskId)) await disposeCardBindingPanel();
     await api(`/api/tasks/${taskId}/abandon`, { method: "POST", body: "{}" });
     await refresh({ quiet: true });
     toast("账号已标记为废弃");
@@ -765,15 +812,16 @@ async function exportSelectedAccounts() {
     const href = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = href;
-    link.download = result.filename;
+    link.download = result.filename || "plus-extractor-export.txt";
+    link.hidden = true;
     document.body.append(link);
     link.click();
     link.remove();
-    URL.revokeObjectURL(href);
+    window.setTimeout(() => URL.revokeObjectURL(href), 0);
     const failureText = result.failures && result.failures.length
       ? `，${result.failures.length} 个失败`
       : "";
-    setExportMessage(`已导出 ${result.count}/${result.requested} 个账号${failureText}。`, result.failures && result.failures.length ? "error" : "success");
+    setExportMessage(`已自动下载 ${result.count}/${result.requested} 个账号的 TXT 文件${failureText}。`, result.failures && result.failures.length ? "error" : "success");
   } catch (error) {
     setExportMessage(error.message, "error");
   } finally {
@@ -885,6 +933,33 @@ async function generateCardProfile(taskId, button) {
   }
 }
 
+async function generateSelectedCardProfiles() {
+  const ids = [...state.selectedExportTaskIds];
+  if (!ids.length || ids.length > 10) {
+    setBatchMessage("请选择 1–10 个账号生成绑卡信息。", "error");
+    return;
+  }
+  state.batchRunning = true;
+  elements.batchCardProfileButton.textContent = "批量生成中…";
+  updateExportControls();
+  try {
+    const payload = await api("/api/tasks/batch/card-profile", {
+      method: "POST",
+      body: JSON.stringify({ ids })
+    });
+    mergeBatchTasks(payload.batch.tasks);
+    await refresh({ quiet: true });
+    setBatchMessage(`已为 ${payload.batch.generated}/${payload.batch.requested} 个已选账号生成绑卡信息。`, "success");
+    toast(`绑卡信息已生成 ${payload.batch.generated}/${payload.batch.requested}`);
+  } catch (error) {
+    setBatchMessage(error.message || String(error), "error");
+  } finally {
+    state.batchRunning = false;
+    elements.batchCardProfileButton.textContent = "一键生成绑卡信息（已选账号）";
+    updateExportControls();
+  }
+}
+
 let stripeJsPromise = null;
 
 function loadStripeJs() {
@@ -923,102 +998,105 @@ async function resolveStripeForIntent(clientSecret, publishableKeys) {
   throw lastError || new Error("没有匹配当前 SetupIntent 的 Stripe 公钥。");
 }
 
-function createCardBindingPanel(task) {
-  const root = document.createElement("section");
-  root.className = `card-binding-panel${task.cardProfile ? "" : " unavailable"}`;
-  root.innerHTML = `
-    <div class="card-binding-panel-header">
-      <div>
-        <p class="section-index">CARD INPUT · STRIPE</p>
-        <h5>添加支付方式</h5>
-      </div>
-      <button class="button ghost" data-action="reload" type="button" disabled>重新载入</button>
-    </div>
-    <p class="card-binding-privacy">卡号、有效期与 CVC 直接进入 Stripe 托管 iframe，本地 API、任务文件和日志均不接收这些字段。</p>
-    <div class="payment-card-visual">
-      <div class="payment-card-topline"><span class="payment-card-chip" aria-hidden="true"></span><strong>SECURE CARD</strong></div>
-      <div class="stripe-card-frame" data-field="card"></div>
-      <div class="payment-card-footer">
-        <span>持卡人</span><code data-field="name"></code>
-        <span>账单地址</span><code data-field="address"></code>
-      </div>
-    </div>
-    <p class="card-binding-message" data-field="message" role="status" aria-live="polite"></p>
-    <button class="button primary card-binding-submit" data-action="submit" type="button" disabled>确认绑定</button>
-  `;
-  root.querySelector('[data-field="name"]').textContent = task.cardProfile
-    ? `${task.cardProfile.firstName} ${task.cardProfile.lastName}`
-    : "等待生成资料";
-  root.querySelector('[data-field="address"]').textContent = task.cardProfile
-    ? task.cardProfile.fullAddress
-    : "生成姓名与地址后自动加载安全输入框";
-  root.querySelector('[data-field="message"]').textContent = task.cardProfile
-    ? "正在创建一次性 SetupIntent…"
-    : "请先生成绑卡姓名与地址。";
-  return {
-    root,
-    reloadButton: root.querySelector('[data-action="reload"]'),
-    submitButton: root.querySelector('[data-action="submit"]'),
-    message: root.querySelector('[data-field="message"]'),
-    cardMount: root.querySelector('[data-field="card"]')
-  };
+function setSharedCardMessage(text, kind = "") {
+  elements.sharedCardMessage.textContent = text;
+  elements.sharedCardMessage.className = kind ? `card-binding-message ${kind}` : "card-binding-message";
+  elements.sharedCardSection.dataset.state = kind === "error" ? "error" : kind === "success" ? "ready" : "running";
+}
+
+function resetSharedCardPanel(message = "尚未准备批量绑卡会话。") {
+  elements.sharedCardMount.replaceChildren();
+  elements.sharedCardSubmit.disabled = true;
+  elements.sharedCardReload.disabled = true;
+  elements.sharedCardSection.dataset.state = "idle";
+  setSharedCardMessage(message);
+  elements.sharedCardSection.dataset.state = "idle";
+}
+
+function mergeBatchTasks(tasks = []) {
+  if (!state.bootstrap || !Array.isArray(state.bootstrap.tasks)) return;
+  const updates = new Map(tasks.map((task) => [task.id, task]));
+  state.bootstrap.tasks = state.bootstrap.tasks.map((task) => updates.get(task.id) || task);
+}
+
+async function cancelCardPreparations(preparations = []) {
+  await Promise.all(preparations.map((preparation) => api(`/api/tasks/${preparation.taskId}/card-binding/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ token: preparation.token })
+  }).catch(() => null)));
 }
 
 async function disposeCardBindingPanel({ cancel = true } = {}) {
   const session = state.cardBindingSession;
-  if (!session) return;
+  if (!session) {
+    resetSharedCardPanel();
+    return;
+  }
   session.disposed = true;
   if (session.cardElement && typeof session.cardElement.destroy === "function") session.cardElement.destroy();
   state.cardBindingSession = null;
-  if (cancel && !session.completed && session.preparation && session.preparation.token) {
-    await api(`/api/tasks/${session.taskId}/card-binding/cancel`, {
-      method: "POST",
-      body: JSON.stringify({ token: session.preparation.token })
-    }).catch(() => {});
+  if (cancel) {
+    const incomplete = session.preparations.filter((preparation) => !session.completedTaskIds.has(preparation.taskId));
+    await cancelCardPreparations(incomplete);
   }
+  resetSharedCardPanel();
+  updateExportControls();
 }
 
-async function initializeCardBindingPanel(task, panel) {
-  if (!task.cardProfile || !panel.root.isConnected) return;
-  await disposeCardBindingPanel();
-  const session = {
-    taskId: task.id,
-    panel,
-    preparation: null,
-    cardElement: null,
-    completed: false,
-    disposed: false
-  };
-  state.cardBindingSession = session;
+function readCardBindingRetryCount() {
+  const retryLimit = Number(state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.maxRetries) || 10;
+  const configuredRetries = Number(elements.batchRetryCount.value);
+  if (!Number.isInteger(configuredRetries) || configuredRetries < 0 || configuredRetries > retryLimit) {
+    setBatchMessage(`自动重试次数必须是 0–${retryLimit} 的整数。`, "error");
+    elements.batchRetryCount.focus();
+    return null;
+  }
+  return configuredRetries;
+}
 
-  const setMessage = (text, kind = "") => {
-    if (session.disposed || !panel.root.isConnected) return;
-    panel.message.textContent = text;
-    panel.message.className = kind ? `card-binding-message ${kind}` : "card-binding-message";
-  };
-  panel.reloadButton.addEventListener("click", async () => {
-    panel.reloadButton.disabled = true;
-    await disposeCardBindingPanel();
-    initializeCardBindingPanel(task, panel);
-  });
-
+async function startBatchCardBinding(explicitIds = null) {
+  const ids = Array.isArray(explicitIds) ? explicitIds : [...state.selectedExportTaskIds];
+  if (!ids.length || ids.length > 10) {
+    setBatchMessage("请选择 1–10 个账号执行并发绑卡。", "error");
+    return;
+  }
+  const maxRetries = readCardBindingRetryCount();
+  if (maxRetries == null) return;
+  if (state.cardBindingSession) await disposeCardBindingPanel();
+  state.batchRunning = true;
+  elements.batchCardBindButton.textContent = "并发准备中…";
+  elements.sharedCardCount.textContent = `正在同时准备 ${ids.length} 个账号的 SetupIntent…`;
+  setSharedCardMessage("正在通过 US 会话并发准备全部账号…");
+  updateExportControls();
   try {
-    const prepared = await api(`/api/tasks/${task.id}/card-binding/prepare`, {
+    const payload = await api("/api/tasks/batch/card-binding/prepare", {
       method: "POST",
-      body: "{}"
+      body: JSON.stringify({ ids, maxRetries })
     });
-    session.preparation = prepared.preparation;
-    if (session.disposed || !panel.root.isConnected) {
-      await api(`/api/tasks/${task.id}/card-binding/cancel`, {
-        method: "POST",
-        body: JSON.stringify({ token: session.preparation.token })
-      }).catch(() => {});
-      return;
+    const batch = payload.batch;
+    mergeBatchTasks(batch.tasks);
+    if (!batch.preparations || !batch.preparations.length) {
+      throw new Error(batch.failures && batch.failures[0] && batch.failures[0].message || "没有账号完成绑卡准备。");
     }
+    const session = {
+      taskIds: ids,
+      preparations: batch.preparations,
+      completedTaskIds: new Set(),
+      maxRetries,
+      retryDelayMs: Number(batch.retryDelayMs || state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.retryDelayMs) || 0,
+      preparationRetryRounds: Number(batch.retryRounds || 0),
+      stripe: null,
+      cardElement: null,
+      disposed: false
+    };
+    state.cardBindingSession = session;
     await loadStripeJs();
-    const stripe = await resolveStripeForIntent(session.preparation.clientSecret, session.preparation.publishableKeys);
-    if (session.disposed || !panel.root.isConnected) return;
-    const stripeElements = stripe.elements({ locale: "zh" });
+    session.stripe = await resolveStripeForIntent(batch.preparations[0].clientSecret, batch.preparations[0].publishableKeys);
+    const intentChecks = await Promise.all(batch.preparations.map((preparation) => session.stripe.retrieveSetupIntent(preparation.clientSecret)));
+    const unmatched = intentChecks.find((result) => !result || !result.setupIntent);
+    if (unmatched) throw unmatched.error || new Error("批量 SetupIntent 未使用同一 Stripe 公钥。 ");
+    if (session.disposed) return;
+    const stripeElements = session.stripe.elements({ locale: "zh" });
     session.cardElement = stripeElements.create("card", {
       hidePostalCode: true,
       style: {
@@ -1031,65 +1109,138 @@ async function initializeCardBindingPanel(task, panel) {
         invalid: { color: "#ff8d8d" }
       }
     });
-    session.cardElement.mount(panel.cardMount);
+    session.cardElement.mount(elements.sharedCardMount);
     session.cardElement.on("ready", () => {
-      setMessage("Stripe 卡输入框已就绪。", "success");
-      panel.submitButton.disabled = false;
-      panel.reloadButton.disabled = false;
+      elements.sharedCardSubmit.disabled = false;
+      elements.sharedCardReload.disabled = false;
+      elements.sharedCardCount.textContent = `${batch.prepared}/${batch.requested} 个账号已准备；卡资料只需填写一次。`;
+      setSharedCardMessage("Stripe 卡输入框已就绪，可以并发确认。", "success");
     });
     session.cardElement.on("change", (event) => {
-      if (event.error) setMessage(event.error.message, "error");
-      else if (event.complete) setMessage("卡资料填写完成，可以确认绑定。", "success");
-      else setMessage("请填写卡号、有效期和 CVC。");
+      if (event.error) setSharedCardMessage(event.error.message, "error");
+      else if (event.complete) setSharedCardMessage("卡资料填写完成，可以确认并发绑定。", "success");
+      else setSharedCardMessage("请填写卡号、有效期和 CVC。");
     });
     session.cardElement.on("loaderror", (event) => {
-      panel.submitButton.disabled = true;
-      panel.reloadButton.disabled = false;
-      setMessage(event && event.error && event.error.message || "Stripe 卡输入框加载失败。", "error");
+      elements.sharedCardSubmit.disabled = true;
+      elements.sharedCardReload.disabled = false;
+      setSharedCardMessage(event && event.error && event.error.message || "Stripe 卡输入框加载失败。", "error");
     });
+    setBatchMessage(`并发绑卡已准备 ${batch.prepared}/${batch.requested} 个账号；请在独立卡片中填写一次卡资料。`, batch.failures.length ? "error" : "success");
+  } catch (error) {
+    if (state.cardBindingSession) await disposeCardBindingPanel();
+    setSharedCardMessage(error.message || String(error), "error");
+    setBatchMessage(error.message || String(error), "error");
+  } finally {
+    state.batchRunning = false;
+    elements.batchCardBindButton.textContent = "并发绑卡";
+    updateExportControls();
+  }
+}
 
-    panel.submitButton.addEventListener("click", async () => {
-      panel.submitButton.disabled = true;
-      panel.reloadButton.disabled = true;
-      setMessage("正在由 Stripe 验证并绑定…");
-      try {
-        const result = await stripe.confirmCardSetup(session.preparation.clientSecret, {
+async function submitBatchCardBinding() {
+  const session = state.cardBindingSession;
+  if (!session || !session.cardElement || session.disposed) return;
+  state.batchRunning = true;
+  elements.sharedCardSubmit.disabled = true;
+  elements.sharedCardReload.disabled = true;
+  setSharedCardMessage(`?????? ${session.preparations.length} ? SetupIntent?`);
+  updateExportControls();
+  try {
+    const bindings = [];
+    const finalRejectedPreparations = [];
+    let pending = [...session.preparations];
+    let stripeRetryRounds = 0;
+    let stripeRetryExecutions = 0;
+    let maxDispatchSkewMs = 0;
+    let firstStripeFailure = null;
+    while (pending.length) {
+      const roundDispatchTimes = [];
+      const confirmationPromises = pending.map((preparation) => {
+        roundDispatchTimes.push(performance.now());
+        return session.stripe.confirmCardSetup(preparation.clientSecret, {
           payment_method: {
             card: session.cardElement,
-            billing_details: session.preparation.billing,
+            billing_details: preparation.billing,
             allow_redisplay: "always"
           },
           set_as_default_payment_method: true
-        });
-        if (result.error) throw result.error;
-        if (!result.setupIntent || result.setupIntent.status !== "succeeded") {
-          throw new Error(`SetupIntent 当前状态：${result.setupIntent && result.setupIntent.status || "unknown"}`);
-        }
-        const paymentMethod = result.setupIntent.payment_method;
-        const paymentMethodId = typeof paymentMethod === "string" ? paymentMethod : paymentMethod && paymentMethod.id;
-        if (!paymentMethodId) throw new Error("Stripe 未返回 payment method id。");
-        await api(`/api/tasks/${task.id}/card-binding/complete`, {
-          method: "POST",
-          body: JSON.stringify({
-            token: session.preparation.token,
+        }).then((result) => {
+          if (result.error) throw result.error;
+          if (!result.setupIntent || result.setupIntent.status !== "succeeded") {
+            throw new Error(`SetupIntent ?????${result.setupIntent && result.setupIntent.status || "unknown"}`);
+          }
+          const paymentMethod = result.setupIntent.payment_method;
+          const paymentMethodId = typeof paymentMethod === "string" ? paymentMethod : paymentMethod && paymentMethod.id;
+          if (!paymentMethodId) throw new Error("Stripe ??? payment method id?");
+          return {
+            id: preparation.taskId,
+            token: preparation.token,
             setupIntentId: result.setupIntent.id,
             paymentMethodId
-          })
+          };
         });
-        session.completed = true;
-        setMessage("绑定成功，支付方式已通过 US 会话核验。", "success");
-        await disposeCardBindingPanel({ cancel: false });
-        await refresh({ quiet: true });
-        toast("支付方式绑定成功");
-      } catch (error) {
-        setMessage(error && error.message || String(error), "error");
-        panel.submitButton.disabled = false;
-        panel.reloadButton.disabled = false;
+      });
+      if (roundDispatchTimes.length > 1) {
+        maxDispatchSkewMs = Math.max(maxDispatchSkewMs,
+          Math.max(...roundDispatchTimes) - Math.min(...roundDispatchTimes));
       }
+      const settled = await Promise.allSettled(confirmationPromises);
+      const retryable = [];
+      for (let index = 0; index < settled.length; index += 1) {
+        const outcome = settled[index];
+        if (outcome.status === "fulfilled") bindings.push(outcome.value);
+        else {
+          firstStripeFailure = firstStripeFailure || outcome.reason;
+          retryable.push(pending[index]);
+        }
+      }
+      if (!retryable.length) break;
+      if (stripeRetryRounds >= session.maxRetries) {
+        finalRejectedPreparations.push(...retryable);
+        break;
+      }
+      stripeRetryRounds += 1;
+      stripeRetryExecutions += retryable.length;
+      setSharedCardMessage(
+        `Stripe ???? ${retryable.length} ??${session.retryDelayMs / 1000} ?????? ${stripeRetryRounds}/${session.maxRetries}?`,
+        "error"
+      );
+      if (session.retryDelayMs) await new Promise((resolve) => setTimeout(resolve, session.retryDelayMs));
+      pending = retryable;
+    }
+    await cancelCardPreparations(finalRejectedPreparations);
+    if (!bindings.length) {
+      throw firstStripeFailure || new Error("Stripe ????? SetupIntent?");
+    }
+    const payload = await api("/api/tasks/batch/card-binding/complete", {
+      method: "POST",
+      body: JSON.stringify({ bindings, maxRetries: session.maxRetries })
     });
+    const batch = payload.batch;
+    mergeBatchTasks(batch.tasks);
+    const failedIds = new Set((batch.failures || []).map((failure) => failure.id));
+    const verificationFailures = session.preparations.filter((preparation) => failedIds.has(preparation.taskId));
+    await cancelCardPreparations(verificationFailures);
+    for (const task of batch.tasks || []) {
+      if (task.state === "CARD_BOUND") session.completedTaskIds.add(task.id);
+    }
+    const completed = session.completedTaskIds.size;
+    const requested = session.taskIds.length;
+    await disposeCardBindingPanel({ cancel: false });
+    await refresh({ quiet: true });
+    setBatchMessage(
+      `???????${completed}/${requested}????? ${session.preparationRetryRounds}/${session.maxRetries}?Stripe ?? ${stripeRetryRounds}/${session.maxRetries}?${stripeRetryExecutions} ?????US ???? ${batch.retryRounds}/${batch.maxRetries}?${batch.retryExecutions} ??????????? ${maxDispatchSkewMs.toFixed(3)} ms?`,
+      completed === requested ? "success" : "error"
+    );
+    toast(`?????? ${completed}/${requested}`);
   } catch (error) {
-    panel.reloadButton.disabled = false;
-    setMessage(error.message || String(error), "error");
+    await disposeCardBindingPanel();
+    setSharedCardMessage(error && error.message || String(error), "error");
+    setBatchMessage(error && error.message || String(error), "error");
+  } finally {
+    state.batchRunning = false;
+    updateExportControls();
   }
 }
 
@@ -1104,6 +1255,15 @@ elements.exportAccountsButton.addEventListener("click", exportSelectedAccounts);
 elements.selectFailedButton.addEventListener("click", selectFailedTasks);
 elements.batchRegisterButton.addEventListener("click", () => runSelectedBatch("registration", elements.batchRegisterButton));
 elements.batchExtractButton.addEventListener("click", () => runSelectedBatch("checkout_link", elements.batchExtractButton));
+elements.batchCardProfileButton.addEventListener("click", generateSelectedCardProfiles);
+elements.batchCardBindButton.addEventListener("click", () => startBatchCardBinding());
+elements.sharedCardSubmit.addEventListener("click", submitBatchCardBinding);
+elements.sharedCardReload.addEventListener("click", async () => {
+  const ids = state.cardBindingSession ? [...state.cardBindingSession.taskIds] : [...state.selectedExportTaskIds];
+  await disposeCardBindingPanel();
+  state.selectedExportTaskIds = new Set(ids);
+  await startBatchCardBinding();
+});
 elements.batchSubscribeButton.addEventListener("click", () => runSelectedBatch("trial_payment", elements.batchSubscribeButton));
 elements.refreshButton.addEventListener("click", async () => {
   await disposeCardBindingPanel();

@@ -13,10 +13,9 @@ const AUTH_ORIGIN = "https://auth.openai.com";
 const ACCOUNT_API = `${AUTH_ORIGIN}/api/accounts`;
 const DEFAULT_MODES = Object.freeze(["signup", "login_or_signup", "login"]);
 const NON_RETRYABLE_SESSION_ERRORS = new Set([
-  "REGISTRATION_CLOUDFLARE_CHALLENGE",
-  "REGISTRATION_US_EXIT_REQUIRED",
-  "REGISTRATION_AUTH_US_EXIT_REQUIRED"
+  "REGISTRATION_CLOUDFLARE_CHALLENGE"
 ]);
+const TRANSIENT_SESSION_ERROR = /(?:ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|EPROTO|ECONNRESET|ETIMEDOUT|socket disconnected|TLS connection|tlsv1 alert|network path|Target page, context or browser has been closed|Timeout \d+ms exceeded)/i;
 
 function findBrowserExecutable(explicitPath = "") {
   const candidates = [
@@ -90,6 +89,20 @@ function requireSuccess(step, result) {
   return result;
 }
 
+function normalizeSessionInitializationError(error) {
+  if (error && error.code && String(error.code).startsWith("REGISTRATION_")) return error;
+  const message = String(error && error.message || error || "");
+  if (TRANSIENT_SESSION_ERROR.test(message)) {
+    return new AppError(
+      502,
+      "REGISTRATION_NETWORK_TRANSIENT",
+      "Registration network path closed before the protocol session was ready.",
+      error
+    );
+  }
+  return error;
+}
+
 function withTimeout(promise, timeoutMs = 3_000) {
   return Promise.race([promise, new Promise((resolve) => setTimeout(resolve, timeoutMs))]);
 }
@@ -114,6 +127,10 @@ class AuthProtocolRuntime {
       ? Boolean(options.headless)
       : process.env.LOCAL_WEB_PROTOCOL_HEADLESS === "1";
     this.timeoutMs = Number(options.timeoutMs) || 60_000;
+    this.callbackRetryDelayMs = Object.hasOwn(options, "callbackRetryDelayMs")
+      ? Math.max(0, Number(options.callbackRetryDelayMs) || 0)
+      : 8_000;
+    this.sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.stealth = options.stealth !== false;
     this.relayFactory = options.relayFactory || ((selectedProxy) => new BrowserProxyRelay(selectedProxy, options.relayOptions));
     this.relay = null;
@@ -428,22 +445,42 @@ class AuthProtocolRuntime {
     const nextUrl = result && result.pagePayload && result.pagePayload.url
       || result && result.data && result.data.continue_url
       || null;
+    let parsedCallback = null;
+    let callbackError = null;
     if (nextUrl) {
-      const parsed = new URL(nextUrl);
-      if (parsed.protocol !== "https:") throw new AppError(502, "REGISTRATION_CONTINUATION_INVALID", "Registration continuation URL is invalid.");
-      await this.page.goto(parsed.href, { waitUntil: "domcontentloaded", timeout: this.timeoutMs });
+      parsedCallback = new URL(nextUrl);
+      if (parsedCallback.protocol !== "https:") throw new AppError(502, "REGISTRATION_CONTINUATION_INVALID", "Registration continuation URL is invalid.");
+      try {
+        await this.page.goto(parsedCallback.href, { waitUntil: "domcontentloaded", timeout: this.timeoutMs });
+      } catch (error) {
+        callbackError = normalizeSessionInitializationError(error);
+      }
     }
     // Read the session through BrowserContext.request: it shares this browser
     // context's callback cookies and proxy, but is independent of a transient
     // callback page whose JavaScript context may be replaced mid-request.
-    let session = null;
-    try {
-      const response = await this.context.request.get(`${CHATGPT_ORIGIN}/api/auth/session?_=${Date.now()}`, {
-        timeout: this.timeoutMs,
-        headers: { Accept: "application/json", "Cache-Control": "no-store" }
-      });
-      if (response.ok()) session = await response.json();
-    } catch {}
+    const readContextSession = async () => {
+      try {
+        const response = await this.context.request.get(`${CHATGPT_ORIGIN}/api/auth/session?_=${Date.now()}`, {
+          timeout: this.timeoutMs,
+          headers: { Accept: "application/json", "Cache-Control": "no-store" }
+        });
+        return response.ok() ? await response.json() : null;
+      } catch {
+        return null;
+      }
+    };
+    let session = await readContextSession();
+    if (!session && parsedCallback && callbackError) {
+      await this.sleep(this.callbackRetryDelayMs);
+      try {
+        await this.page.goto(parsedCallback.href, { waitUntil: "commit", timeout: this.timeoutMs });
+        callbackError = null;
+      } catch (error) {
+        callbackError = normalizeSessionInitializationError(error);
+      }
+      session = await readContextSession();
+    }
     if (!session) {
       const response = await this.page.goto(`${CHATGPT_ORIGIN}/api/auth/session?_=${Date.now()}`, {
         waitUntil: "commit",
@@ -457,6 +494,7 @@ class AuthProtocolRuntime {
         }
       }
     }
+    if (!session && callbackError) throw callbackError;
     if (session && (session.user || session.accessToken || session.expires)) {
       await this.page.goto(`${CHATGPT_ORIGIN}/`, {
         waitUntil: "commit",
@@ -466,7 +504,8 @@ class AuthProtocolRuntime {
     return {
       authenticated: Boolean(session && (session.user || session.accessToken || session.expires)),
       origin: new URL(this.page.url()).origin,
-      pathname: new URL(this.page.url()).pathname
+      pathname: new URL(this.page.url()).pathname,
+      authSession: session && typeof session === "object" && !Array.isArray(session) ? session : null
     };
   }
 
@@ -476,6 +515,16 @@ class AuthProtocolRuntime {
     const sessionPath = path.join(directory, `${safeTaskId}.storage.json`);
     await this.context.storageState({ path: sessionPath });
     return sessionPath;
+  }
+
+  async saveAuthSession(taskId, directory, authSession) {
+    if (!authSession || typeof authSession !== "object" || Array.isArray(authSession)) return null;
+    if (!String(authSession.accessToken || "").trim()) return null;
+    fs.mkdirSync(directory, { recursive: true });
+    const safeTaskId = /^[0-9a-f-]{16,}$/i.test(String(taskId || "")) ? String(taskId) : `registration-${Date.now()}`;
+    const authSessionPath = path.join(directory, `${safeTaskId}.auth-session.json`);
+    fs.writeFileSync(authSessionPath, JSON.stringify(authSession), { encoding: "utf8", mode: 0o600 });
+    return authSessionPath;
   }
 
   async close() {
@@ -493,6 +542,10 @@ class ChatGptProtocolRegistrationClient {
     this.sessionDirectory = path.resolve(options.sessionDirectory || path.join(__dirname, "../../data/sessions"));
     this.modes = Array.isArray(options.modes) && options.modes.length ? [...options.modes] : [...DEFAULT_MODES];
     this.proxySessionId = options.proxySessionId || "";
+    this.retryDelayMs = Object.hasOwn(options, "retryDelayMs")
+      ? Math.max(0, Number(options.retryDelayMs) || 0)
+      : 8_000;
+    this.sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.runtimeFactory = options.runtimeFactory
       || ((proxy) => new AuthProtocolRuntime(proxy, options));
   }
@@ -531,23 +584,30 @@ class ChatGptProtocolRegistrationClient {
       this.proxySessionId ? { sessionId: this.proxySessionId } : undefined
     );
     await reportProgress(`已生成账户资料：${profile.fullName}，${profile.age} 岁`);
-    if (sessionProxy !== proxy) await reportProgress("已为注册流程启用固定 US 出口会话");
+    if (sessionProxy !== proxy) {
+      await reportProgress("注册流程使用单一代理凭据；实际出口切换仍由代理后台模式决定");
+    }
     let runtime;
     let start;
     let lastError;
     let mailboxBaseline = null;
-    for (const mode of this.modes) {
+    for (let modeIndex = 0; modeIndex < this.modes.length; modeIndex += 1) {
+      const mode = this.modes[modeIndex];
       const candidate = this.runtimeFactory(sessionProxy);
       try {
         await reportProgress(`正在初始化 ${mode} 协议会话`);
         await candidate.open(mode);
-        const candidateBaseline = typeof readVerificationSnapshot === "function"
-          ? await readVerificationSnapshot({
-            proxy: sessionProxy,
-            requestText: candidate.requestText.bind(candidate),
-            timeoutMs: 30_000
-          })
-          : null;
+        let candidateBaseline = null;
+        if (typeof readVerificationSnapshot === "function") {
+          try {
+            candidateBaseline = await readVerificationSnapshot({
+              proxy: sessionProxy,
+              timeoutMs: 30_000
+            });
+          } catch {
+            await reportProgress("邮箱基线读取暂时失败；保留当前注册会话并在验证码阶段继续轮询");
+          }
+        }
         const body = {
           username: { kind: "email", value: email },
           ...(mode === "signup" ? { screen_hint: "signup" } : {}),
@@ -564,9 +624,13 @@ class ChatGptProtocolRegistrationClient {
         await reportProgress("邮箱身份已通过 authorize/continue 接口提交");
         break;
       } catch (error) {
-        lastError = error;
+        lastError = normalizeSessionInitializationError(error);
         await candidate.close();
-        if (NON_RETRYABLE_SESSION_ERRORS.has(error && error.code)) throw error;
+        if (NON_RETRYABLE_SESSION_ERRORS.has(lastError && lastError.code)) throw lastError;
+        if (modeIndex + 1 < this.modes.length) {
+          await reportProgress(`注册网络节点未就绪，等待 ${Math.ceil(this.retryDelayMs / 1000)} 秒后重建浏览器上下文`);
+          await this.sleep(this.retryDelayMs);
+        }
       }
     }
     if (!runtime) throw lastError || new AppError(502, "REGISTRATION_PROTOCOL_SESSION_FAILED", "Protocol session initialization failed.");
@@ -591,10 +655,10 @@ class ChatGptProtocolRegistrationClient {
           timeoutMs: 3 * 60_000,
           pollIntervalMs: 3_000,
           proxy: sessionProxy,
-          requestText: runtime.requestText.bind(runtime),
           ...(mailboxBaseline ? {
             afterMessageCount: mailboxBaseline.messageCount,
-            afterLatestMessageAt: mailboxBaseline.latestMessageAt
+            afterLatestMessageAt: mailboxBaseline.latestMessageAt,
+            afterVerificationCode: mailboxBaseline.verificationCode || ""
           } : {})
         });
         const validated = requireSuccess("email-otp/validate", await runtime.call({
@@ -640,6 +704,9 @@ class ChatGptProtocolRegistrationClient {
         throw new AppError(502, "REGISTRATION_SESSION_NOT_AUTHENTICATED", "Registration finished without an authenticated ChatGPT session.");
       }
       const sessionPath = await runtime.saveSession(taskId, this.sessionDirectory);
+      const authSessionPath = completion.authSession && typeof runtime.saveAuthSession === "function"
+        ? await runtime.saveAuthSession(taskId, this.sessionDirectory, completion.authSession)
+        : null;
       await reportProgress(created ? "ChatGPT 账户协议注册完成" : "ChatGPT 未完成账户会话已恢复");
       return Object.freeze({
         account: maskEmail(email),
@@ -647,8 +714,18 @@ class ChatGptProtocolRegistrationClient {
         profile,
         registeredAt: new Date().toISOString(),
         transport: "auth_protocol",
-        session: Object.freeze({ kind: "playwright_storage_state", path: sessionPath })
+        session: Object.freeze({
+          kind: "playwright_storage_state",
+          path: sessionPath,
+          ...(authSessionPath ? {
+            authSessionPath,
+            authSessionCachedAt: new Date().toISOString(),
+            authSessionExpiresAt: completion.authSession.expires || null
+          } : {})
+        })
       });
+    } catch (error) {
+      throw normalizeSessionInitializationError(error);
     } finally {
       await runtime.close();
     }
@@ -658,6 +735,7 @@ class ChatGptProtocolRegistrationClient {
 module.exports = {
   ACCOUNT_API,
   AuthProtocolRuntime,
+  AuthProtocolRuntime,
   ChatGptProtocolRegistrationClient,
   buildAboutYouSubmission,
   createStickyProxySession,
@@ -665,5 +743,6 @@ module.exports = {
   isCompletionPage,
   isOtpPage,
   parseTrace,
+  normalizeSessionInitializationError,
   responseError
 };

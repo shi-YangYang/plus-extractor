@@ -111,7 +111,7 @@
                 rows="6"
                 autocomplete="off"
                 spellcheck="false"
-                placeholder="icloud邮箱---https://接码平台/messages/...&#10;icloud邮箱----https://接码平台/messages/..."
+                placeholder="icloud邮箱---https://接码平台/messages/...&#10;icloud邮箱----https://icloud.biubiu007.com/console/open.php?mail=...&amp;pwd=...&amp;limit=1&#10;icloud邮箱----https://icloud-api.top/s/TOKEN/icloud邮箱"
               ></textarea>
             </label>
             <p class="generated-profile-note">账户姓名将自动生成为 <code>First Last</code>，年龄随机为 20–40 岁；协议会识别资料页的 <code>age</code> / <code>birthday</code> 变体并提交对应资料。</p>
@@ -135,7 +135,7 @@
               <span>导出格式</span>
               <select id="export-format">
                 <option value="email_url">邮箱---URL</option>
-                <option value="access_token">Access Token</option>
+                <option value="access_token">Access Token（完整 Session JSON）</option>
               </select>
             </label>
             <button class="button primary" id="export-accounts-button" type="button" disabled>导出所选账号</button>
@@ -147,11 +147,34 @@
               </label>
               <button class="button subtle" id="batch-register-button" type="button" disabled>并发注册</button>
               <button class="button subtle" id="batch-extract-button" type="button" disabled>并发提链</button>
+              <button class="button subtle" id="batch-card-profile-button" type="button" disabled>一键生成绑卡信息（已选账号）</button>
+              <button class="button subtle" id="batch-card-bind-button" type="button" disabled>并发绑卡</button>
               <button class="button primary" id="batch-subscribe-button" type="button" disabled>同步订阅</button>
             </div>
-            <p class="batch-limit-note">并发操作每批最多 10 个；自动重试仅重跑注册/提链失败账号，每轮等待节点切换；同步订阅仍保持单次屏障放行。</p>
+            <p class="batch-limit-note">并发操作每批最多 10 个；注册、提链和绑卡共用自动重试次数。并发绑卡会同时准备全部账号，再由下方独立 Stripe 卡片一次填写、并发确认和核验。</p>
             <p class="form-message account-batch-message" id="account-batch-message" role="status" aria-live="polite"></p>
             <p class="form-message account-export-message" id="account-export-message" role="status" aria-live="polite"></p>
+          </section>
+          <section class="shared-card-binding-section" id="shared-card-binding-section" aria-labelledby="shared-card-binding-heading">
+            <div class="shared-card-binding-header">
+              <div>
+                <p class="section-index">SHARED CARD · STRIPE</p>
+                <h3 id="shared-card-binding-heading">独立卡片 · 并发绑卡</h3>
+                <p id="shared-card-binding-count">选择 1–10 个已完成提链的账号，然后点击“并发绑卡”。</p>
+              </div>
+              <button class="button ghost" id="batch-card-reload" type="button" disabled>重新准备</button>
+            </div>
+            <p class="card-binding-privacy">卡号、有效期和 CVC 仅进入 Stripe 托管 iframe；本地 API 只接收每个账号独立的 SetupIntent、PaymentMethod 标识和一次性准备令牌。</p>
+            <div class="payment-card-visual standalone-payment-card">
+              <div class="payment-card-topline"><span class="payment-card-chip" aria-hidden="true"></span><strong>SECURE BATCH CARD</strong></div>
+              <div class="stripe-card-frame" id="shared-stripe-card"></div>
+              <div class="payment-card-footer">
+                <span>持卡人</span><code>按账号分别使用其账单姓名</code>
+                <span>账单地址</span><code>按账号分别使用其账单地址</code>
+              </div>
+            </div>
+            <p class="card-binding-message" id="shared-card-binding-message" role="status" aria-live="polite">尚未准备批量绑卡会话。</p>
+            <button class="button primary card-binding-submit" id="batch-card-submit" type="button" disabled>确认并发绑定</button>
           </section>
           <div class="task-layout">
             <div class="task-list" id="task-list">

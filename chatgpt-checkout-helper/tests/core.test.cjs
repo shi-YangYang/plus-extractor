@@ -26,10 +26,12 @@ test("checkout payload builders separate the US baseline from the TR promotion",
   const baseline = core.buildBaselineCheckoutPayload();
   const promotion = core.buildPromotionCheckoutPayload({ oneClickTrial: true });
   assert.equal(baseline.entry_point, "all_plans_pricing_modal");
+  assert.deepEqual(baseline.billing_details, { country: "US", currency: "USD" });
   assert.equal("promo_campaign" in baseline, false);
   assert.equal("one_click_trial" in baseline, false);
   assert.equal(promotion.promo_campaign.promo_campaign_id, "plus-1-month-free");
   assert.equal(promotion.one_click_trial, true);
+  assert.deepEqual(promotion.billing_details, { country: "TR", currency: "USD" });
 });
 
 test("promotion payload accepts the campaign selected from account status", () => {
@@ -42,11 +44,11 @@ test("promotion payload accepts the campaign selected from account status", () =
   assert.match(promotion.cancel_url, /promo_campaign=plus-1-month-50-pct-off/);
 });
 
-test("PH_SHORT payload contains only the minimal pricing-route fields", () => {
-  assert.deepEqual(core.buildPhShortPromotionPayload({ campaignId: "plus-1-month-free" }), {
+test("short promotion payload matches the TR request country", () => {
+  assert.deepEqual(core.buildShortPromotionPayload({ campaignId: "plus-1-month-free" }), {
     entry_point: "all_plans_pricing_modal",
     plan_name: "chatgptplusplan",
-    billing_details: { country: "PH", currency: "PHP" },
+    billing_details: { country: "TR", currency: "USD" },
     promo_campaign: {
       promo_campaign_id: "plus-1-month-free",
       is_coupon_from_query_param: false
