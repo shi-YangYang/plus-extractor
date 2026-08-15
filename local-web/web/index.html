@@ -21,6 +21,17 @@
         </div>
       </header>
 
+      <nav class="app-tabs" aria-label="功能页面">
+        <button class="app-tab active" id="workflow-tab" type="button" role="tab" aria-selected="true" aria-controls="workflow-tab-panel" data-tab="workflow">
+          一条龙页
+        </button>
+        <button class="app-tab" id="plus-tab" type="button" role="tab" aria-selected="false" aria-controls="plus-tab-panel" data-tab="plus">
+          Plus 验证
+        </button>
+      </nav>
+
+      <div id="workflow-tab-panel" role="tabpanel" aria-labelledby="workflow-tab" data-tab-panel="workflow">
+
       <aside class="deprecation" role="note">
         <span class="deprecation-icon">!</span>
         <div>
@@ -42,15 +53,32 @@
 
           <form id="proxy-form">
             <div class="proxy-grid">
+              <article class="proxy-card" data-region="REGISTRATION">
+                <div class="proxy-title-row">
+                  <div>
+                    <span class="region-pill registration">ANY</span>
+                    <h3>协议注册代理池（任意地区）</h3>
+                  </div>
+                  <span class="count" id="registration-count">未配置</span>
+                </div>
+                <p class="proxy-purpose">仅用于协议注册与手动接码邮箱探测；RoxyBrowser WebUI 注册使用窗口自身已配置代理。</p>
+                <textarea id="registration-pool" name="REGISTRATION" spellcheck="false" autocomplete="off" placeholder="USER:PASSWORD@HOST:PORT&#10;每行一条，国家不限；单次注册需保持同一出口"></textarea>
+                <div class="card-actions">
+                  <button class="button subtle probe-button" data-region="REGISTRATION" type="button">测试第一个网关</button>
+                  <span class="probe-result" id="registration-probe"></span>
+                </div>
+                <div class="endpoint-list" id="registration-endpoints"></div>
+              </article>
+
               <article class="proxy-card" data-region="US">
                 <div class="proxy-title-row">
                   <div>
                     <span class="region-pill us">US</span>
-                    <h3>主流程代理池</h3>
+                    <h3>支付与提链主代理池</h3>
                   </div>
                   <span class="count" id="us-count">未配置</span>
                 </div>
-                <p class="proxy-purpose">注册 ChatGPT、提链创建阶段、绑卡与支付接口。</p>
+                <p class="proxy-purpose">用于 AT 验证、提链创建阶段、绑卡与支付接口；不再用于注册。</p>
                 <textarea id="us-pool" name="US" spellcheck="false" autocomplete="off" placeholder="USER:PASSWORD@HOST:PORT&#10;每行一条"></textarea>
                 <div class="card-actions">
                   <button class="button subtle probe-button" data-region="US" type="button">测试第一个网关</button>
@@ -78,7 +106,7 @@
             </div>
             <div class="form-footer">
               <p class="form-message" id="proxy-message" role="status" aria-live="polite"></p>
-              <button class="button primary" type="submit">保存并替换代理池</button>
+              <button class="button primary" type="submit">保存填写的代理池</button>
             </div>
           </form>
         </section>
@@ -99,12 +127,40 @@
             <div>
               <p class="section-index">03 · TASKS</p>
               <h2 id="task-heading">账号任务</h2>
-              <p>注册阶段使用 US 代理调用认证协议接口，轮询验证码、自动生成资料并保存本地登录会话；不操作页面表单。</p>
+              <p>协议注册可使用任意地区出口；RoxyBrowser WebUI 保留每个窗口已有代理，两种方式都在完成后保存本地登录会话与 AT 缓存。</p>
             </div>
           </div>
           <form class="registration-form" id="registration-form">
+            <section class="operation-settings" aria-labelledby="operation-settings-heading">
+              <div class="operation-settings-copy">
+                <p class="section-index">ACCOUNT OPERATION LIMIT</p>
+                <h3 id="operation-settings-heading">注册方式与每轮账号数</h3>
+                <p id="operation-settings-summary">N 表示每轮最多操作的账号数；Roxy 窗口数按 ceil(N/2) 计算，并使用各窗口自身已配置代理。</p>
+              </div>
+              <fieldset class="registration-mode-field">
+                <legend>注册方式</legend>
+                <div class="registration-mode-switch" role="group" aria-label="注册方式">
+                  <button class="registration-mode-option" data-registration-mode="protocol" type="button" aria-pressed="true">协议注册</button>
+                  <button class="registration-mode-option" data-registration-mode="roxybrowser" type="button" aria-pressed="false">RoxyBrowser WebUI 注册</button>
+                </div>
+                <input id="registration-mode" type="hidden" value="protocol">
+              </fieldset>
+              <label class="field-label" for="max-account-operations">
+                <span>每轮最大账号数 N</span>
+                <input id="max-account-operations" type="number" min="1" max="30" step="1" value="10" inputmode="numeric">
+              </label>
+              <button class="button subtle" id="operation-settings-save" type="button">保存设置</button>
+              <p class="operation-settings-status" id="roxy-browser-status" role="status">正在读取 RoxyBrowser 状态…</p>
+            </section>
+            <label class="field-label" for="account-import-format">
+              <span>导入方式</span>
+              <select id="account-import-format">
+                <option value="email_url">邮箱 + 接码地址（新注册）</option>
+                <option value="access_token">Access Token / Session JSON（已有账号）</option>
+              </select>
+            </label>
             <label class="field-label account-field" for="account-source">
-              <span>批量导入账号（每行一个，自动识别三条或四条连接线）</span>
+              <span id="account-source-label">批量导入账号（每行一个，自动识别三条或四条连接线）</span>
               <textarea
                 id="account-source"
                 name="accountSource"
@@ -114,7 +170,7 @@
                 placeholder="icloud邮箱---https://接码平台/messages/...&#10;icloud邮箱----https://icloud.biubiu007.com/console/open.php?mail=...&amp;pwd=...&amp;limit=1&#10;icloud邮箱----https://icloud-api.top/s/TOKEN/icloud邮箱"
               ></textarea>
             </label>
-            <p class="generated-profile-note">账户姓名将自动生成为 <code>First Last</code>，年龄随机为 20–40 岁；协议会识别资料页的 <code>age</code> / <code>birthday</code> 变体并提交对应资料。</p>
+            <p class="generated-profile-note" id="account-import-note">账户姓名将自动生成为 <code>First Last</code>，年龄随机为 20–40 岁；协议会识别资料页的 <code>age</code> / <code>birthday</code> 变体并提交对应资料。</p>
             <div class="registration-actions">
               <button class="button subtle" id="mailbox-probe-button" type="button">测试接码读取</button>
               <button class="button primary" id="create-task-button" type="submit">批量导入任务</button>
@@ -146,12 +202,12 @@
                 <input id="batch-retry-count" type="number" min="0" max="10" step="1" value="2" inputmode="numeric">
               </label>
               <button class="button subtle" id="batch-register-button" type="button" disabled>并发注册</button>
-              <button class="button subtle" id="batch-extract-button" type="button" disabled>并发提链</button>
+              <button class="button subtle" id="batch-extract-button" type="button" disabled>重试绑卡后提链</button>
               <button class="button subtle" id="batch-card-profile-button" type="button" disabled>一键生成绑卡信息（已选账号）</button>
-              <button class="button subtle" id="batch-card-bind-button" type="button" disabled>并发绑卡</button>
+              <button class="button subtle" id="batch-card-bind-button" type="button" disabled>绑卡并提链</button>
               <button class="button primary" id="batch-subscribe-button" type="button" disabled>同步订阅</button>
             </div>
-            <p class="batch-limit-note">并发操作每批最多 10 个；注册、提链和绑卡共用自动重试次数。并发绑卡会同时准备全部账号，再由下方独立 Stripe 卡片一次填写、并发确认和核验。</p>
+            <p class="batch-limit-note" id="batch-limit-note">每轮最大账号数由上方 N 控制；注册、绑卡提链和订阅使用同一上限。</p>
             <p class="form-message account-batch-message" id="account-batch-message" role="status" aria-live="polite"></p>
             <p class="form-message account-export-message" id="account-export-message" role="status" aria-live="polite"></p>
           </section>
@@ -159,8 +215,8 @@
             <div class="shared-card-binding-header">
               <div>
                 <p class="section-index">SHARED CARD · STRIPE</p>
-                <h3 id="shared-card-binding-heading">独立卡片 · 并发绑卡</h3>
-                <p id="shared-card-binding-count">选择 1–10 个已完成提链的账号，然后点击“并发绑卡”。</p>
+                <h3 id="shared-card-binding-heading">独立卡片 · 绑卡并提链</h3>
+                <p id="shared-card-binding-count">选择 1–N 个已注册账号，然后点击“绑卡并提链”。</p>
               </div>
               <button class="button ghost" id="batch-card-reload" type="button" disabled>重新准备</button>
             </div>
@@ -173,8 +229,8 @@
                 <span>账单地址</span><code>按账号分别使用其账单地址</code>
               </div>
             </div>
-            <p class="card-binding-message" id="shared-card-binding-message" role="status" aria-live="polite">尚未准备批量绑卡会话。</p>
-            <button class="button primary card-binding-submit" id="batch-card-submit" type="button" disabled>确认并发绑定</button>
+            <p class="card-binding-message" id="shared-card-binding-message" role="status" aria-live="polite">尚未准备绑卡并提链会话。</p>
+            <button class="button primary card-binding-submit" id="batch-card-submit" type="button" disabled>确认绑卡并提链</button>
           </section>
           <div class="task-layout">
             <div class="task-list" id="task-list">
@@ -186,6 +242,50 @@
           </div>
         </section>
       </main>
+      </div>
+
+      <section class="plus-verification-view" id="plus-tab-panel" role="tabpanel" aria-labelledby="plus-tab" data-tab-panel="plus" hidden>
+        <section class="panel plus-verification-panel" aria-labelledby="plus-verification-heading">
+          <div class="panel-heading">
+            <div>
+              <p class="section-index">PLUS ENTITLEMENT</p>
+              <h2 id="plus-verification-heading">批量验证 Plus 是否到账</h2>
+              <p>支持完整 Session JSON/JSONL，也支持裸 AT、<code>Bearer AT</code>、带引号的 AT 或 <code>accessToken=AT</code>；AT 按 opaque token 处理，不限定 JWT 段数。</p>
+            </div>
+          </div>
+          <div class="plus-verification-grid">
+            <div class="plus-import-card">
+              <label class="field-label" for="plus-session-source">
+                <span>Session JSONL / Access Token</span>
+                <textarea
+                  id="plus-session-source"
+                  rows="14"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder='每行一个：完整 Session JSON，或任意合法 opaque Access Token'
+                ></textarea>
+              </label>
+              <p class="plus-privacy-note">Access Token 仅用于本次内存验证，不写入任务库、浏览器存储或页面结果。</p>
+              <div class="plus-import-actions">
+                <input id="plus-file-input" type="file" accept=".txt,.json,.jsonl,text/plain,application/json" hidden>
+                <button class="button subtle" id="plus-file-button" type="button">读取 TXT / JSONL</button>
+                <button class="button ghost" id="plus-clear-button" type="button">清空</button>
+                <button class="button primary" id="plus-verify-button" type="button" disabled>开始批量验证</button>
+              </div>
+              <p class="form-message" id="plus-verification-message" role="status" aria-live="polite"></p>
+            </div>
+            <aside class="plus-summary" aria-label="Plus 验证汇总">
+              <div><span>导入</span><strong id="plus-summary-requested">0</strong></div>
+              <div><span>Plus 已到账</span><strong class="plus-positive" id="plus-summary-active">0</strong></div>
+              <div><span>未到账</span><strong class="plus-neutral" id="plus-summary-inactive">0</strong></div>
+              <div><span>验证失败</span><strong class="plus-negative" id="plus-summary-failed">0</strong></div>
+            </aside>
+          </div>
+          <div class="plus-results" id="plus-results">
+            <div class="empty-state">导入 Session JSON 或 Access Token 后开始验证。</div>
+          </div>
+        </section>
+      </section>
 
       <footer>
         <span>Local API: <code id="api-address">http://127.0.0.1:17890</code></span>
@@ -194,6 +294,6 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
-    <script src="/app.js" defer></script>
+    <script src="/app.js?v=20260811-23-protocol-registration-any-pool" defer></script>
   </body>
 </html>

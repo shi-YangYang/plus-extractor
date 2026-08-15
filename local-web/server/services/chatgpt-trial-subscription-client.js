@@ -11,12 +11,20 @@ const {
 } = require("./chatgpt-checkout-link-client");
 const {
   normalizeCardProfile,
-  resolveAccountId
+  resolveAccountId,
+  summarizePaymentMethod
 } = require("./chatgpt-card-binding-client");
+const {
+  BANGKA_CHECKOUT_CONFIG,
+  CHECKOUT_TAXES_ENDPOINT,
+  buildTaxesBody,
+  parseTaxesContext
+} = require("./chatgpt-bangka-protocol");
 
 const CHECKOUT_SNAPSHOT_ENDPOINT = "/backend-api/payments/checkout/snapshot";
 const CHECKOUT_CONFIRM_ENDPOINT = "/backend-api/payments/checkout/confirm";
 const ACCOUNT_CONTEXT_ENDPOINT = "/backend-api/accounts/check/v4-2023-04-27";
+const PAYMENT_METHODS_ENDPOINT = "/backend-api/payments/payment_methods";
 const CHECKOUT_APPROVAL_FLOW = "checkout_session_approval";
 const PREPARED_SUBSCRIPTION = Symbol("prepared-subscription");
 
@@ -27,14 +35,54 @@ function extractCheckoutReference(checkoutUrl) {
   } catch {
     throw new AppError(409, "TRIAL_CHECKOUT_URL_INVALID", "A valid ChatGPT checkout URL is required.");
   }
-  const match = parsed.pathname.match(/^\/checkout\/(openai_(?:llc|ie))\/(oaics_[A-Za-z0-9_-]{8,255})\/?$/i);
+  const match = parsed.pathname.match(/^\/checkout\/(openai_(?:llc|ie))\/((?:oaics|cs_(?:live|test))_[A-Za-z0-9_-]{8,255})\/?$/i);
   if (parsed.origin !== "https://chatgpt.com" || !match || parsed.username || parsed.password) {
-    throw new AppError(409, "TRIAL_CHECKOUT_URL_INVALID", "A valid ChatGPT OAICS checkout URL is required.");
+    throw new AppError(409, "TRIAL_CHECKOUT_URL_INVALID", "A valid ChatGPT checkout URL is required.");
   }
+  const checkoutSessionId = match[2];
   return Object.freeze({
     url: parsed.href,
     processorEntity: match[1].toLowerCase(),
-    checkoutSessionId: match[2]
+    checkoutSessionId,
+    sessionKind: /^oaics_/i.test(checkoutSessionId) ? "oaics" : "standard"
+  });
+}
+
+function normalizeCheckoutPromotionEvidence(evidence, reference) {
+  if (!evidence) return null;
+  let evidenceReference;
+  try {
+    evidenceReference = extractCheckoutReference(evidence.checkoutUrl);
+  } catch {
+    throw new AppError(409, "TRIAL_CHECKOUT_EVIDENCE_MISMATCH", "The saved promotion evidence does not reference this Checkout.");
+  }
+  if (evidenceReference.processorEntity !== reference.processorEntity
+      || evidenceReference.checkoutSessionId !== reference.checkoutSessionId) {
+    throw new AppError(409, "TRIAL_CHECKOUT_EVIDENCE_MISMATCH", "The saved promotion evidence does not reference this Checkout.");
+  }
+  const discountPercent = Number(evidence.discountPercent);
+  const dueTodayMinorUnits = Number(evidence.dueTodayMinorUnits);
+  const promotionVerification = String(evidence.promotionVerification || "").trim();
+  const campaignId = String(evidence.campaignId || "").trim();
+  const verificationAccepted = ["tr_official_pricing_ui", "us_checkout_detail", "stripe_custom_checkout"].includes(promotionVerification);
+  const zeroAmountVerified = evidence.zeroAmountVerified === true
+    || (evidence.fullDiscountVerified === true && dueTodayMinorUnits === 0);
+  const explicitPercentageRequired = promotionVerification !== "stripe_custom_checkout";
+  if (!zeroAmountVerified
+      || evidence.promotionApplied !== true
+      || !Number.isFinite(dueTodayMinorUnits)
+      || dueTodayMinorUnits !== 0
+      || (explicitPercentageRequired && (!Number.isFinite(discountPercent) || discountPercent < 100))
+      || !verificationAccepted
+      || !/^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/.test(campaignId)) {
+    throw new AppError(409, "TRIAL_PROMOTION_NOT_APPLIED", "The saved Checkout evidence does not verify a 100% first-month promotion.");
+  }
+  return Object.freeze({
+    campaignId,
+    discountPercent,
+    dueTodayMinorUnits,
+    zeroAmountVerified,
+    promotionVerification
   });
 }
 
@@ -50,6 +98,12 @@ function accountHeaders(accessToken, accountId, route, extra = {}) {
 function numberOrZero(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
+}
+
+function numberOrNull(value) {
+  if (value == null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function percentageFromLabel(label) {
@@ -78,7 +132,7 @@ function summarizeCheckout(payload) {
     paymentStatus: String(payload && payload.payment_status || "").toLowerCase(),
     promotionId: String(payload && payload.promo_campaign && payload.promo_campaign.promo_campaign_id || ""),
     discountPercent: discounts.reduce((maximum, item) => Math.max(maximum, numberOrZero(item && item.percentOff)), 0),
-    dueTodayMinorUnits: numberOrZero(state && state.total && state.total.total && state.total.total.minorUnitsAmount),
+    dueTodayMinorUnits: numberOrNull(state && state.total && state.total.total && state.total.total.minorUnitsAmount),
     taxMinorUnits: taxAmounts.reduce((sum, item) => sum + numberOrZero(item && item.minorUnitsAmount), 0),
     taxRatePercent: taxLabels.reduce((maximum, label) => Math.max(maximum, percentageFromLabel(label)), 0),
     taxLabels: Object.freeze(taxLabels),
@@ -98,9 +152,57 @@ function summarizeCheckout(payload) {
   });
 }
 
+function summarizeCheckoutWithEvidence(payload, promotionEvidence) {
+  void promotionEvidence;
+  return summarizeCheckout(payload);
+}
+
+function defaultPaymentMethod(payload, cardBinding) {
+  const methods = Array.isArray(payload && payload.payment_methods)
+    ? payload.payment_methods
+    : Array.isArray(payload && payload.data) ? payload.data : [];
+  const defaultId = String(payload && (
+    payload.default_payment_method_id || payload.defaultPaymentMethodId
+  ) || methods.find((method) => method && (method.default === true || method.is_default === true))?.id || "").trim();
+  if (!/^pm_[A-Za-z0-9_-]{8,255}$/.test(defaultId)) {
+    throw new AppError(409, "TRIAL_DEFAULT_CARD_REQUIRED", "The account payment-method list does not contain a default card.");
+  }
+  const summary = summarizePaymentMethod(payload, defaultId);
+  const sameCard = summary
+    && summary.default === true
+    && summary.brand === String(cardBinding && cardBinding.brand || "").trim().toLowerCase()
+    && summary.last4 === String(cardBinding && cardBinding.last4 || "").trim()
+    && summary.expMonth === Number(cardBinding && cardBinding.expMonth)
+    && summary.expYear === Number(cardBinding && cardBinding.expYear);
+  if (!sameCard) {
+    throw new AppError(409, "TRIAL_DEFAULT_CARD_MISMATCH", "The account default payment method no longer matches the verified bound card.");
+  }
+  return defaultId;
+}
+
+function customCheckoutSummary(live, campaignId) {
+  return Object.freeze({
+    status: String(live && live.status || "open").toLowerCase(),
+    paymentStatus: "unpaid",
+    promotionId: String(campaignId || ""),
+    discountPercent: Number(live && live.discountPercent) || 0,
+    dueTodayMinorUnits: live && live.dueTodayMinorUnits == null ? null : Number(live.dueTodayMinorUnits),
+    taxMinorUnits: Number(live && live.taxMinorUnits) || 0,
+    taxRatePercent: Number(live && live.taxRatePercent) || 0,
+    taxLabels: Object.freeze(Array.isArray(live && live.taxLabels) ? [...live.taxLabels] : []),
+    canConfirm: live && live.canConfirm === true,
+    requiresManualApproval: false,
+    paymentMethodTypes: Object.freeze(["card"]),
+    billing: live && live.billing || Object.freeze({
+      name: "",
+      address: Object.freeze({ line1: "", city: "", state: "", postal_code: "", country: "" })
+    })
+  });
+}
+
 function assertTrialCheckout(summary, { manualApprovalConfirmed = false } = {}) {
-  if (!summary.promotionId || summary.discountPercent < 100 || summary.dueTodayMinorUnits !== 0) {
-    throw new AppError(409, "TRIAL_PROMOTION_NOT_APPLIED", "The checkout no longer contains a 100% first-month promotion.");
+  if (!summary.promotionId || summary.dueTodayMinorUnits !== 0) {
+    throw new AppError(409, "TRIAL_PROMOTION_NOT_APPLIED", "The live Checkout amount due today is not zero.");
   }
   if (summary.requiresManualApproval && !manualApprovalConfirmed) {
     throw new AppError(409, "TRIAL_SUBSCRIPTION_ACTION_REQUIRED", "The checkout requires manual approval.");
@@ -253,8 +355,9 @@ class ChatGptTrialSubscriptionClient {
   }
 
   async postConfirm(runtime, authenticated, accountId, body, preparedSentinelHeaders = null) {
-    const sentinelHeaders = preparedSentinelHeaders
-      || await runtime.acquireSentinelHeaders(CHECKOUT_APPROVAL_FLOW);
+    const sentinelHeaders = preparedSentinelHeaders === false
+      ? {}
+      : preparedSentinelHeaders || await runtime.acquireSentinelHeaders(CHECKOUT_APPROVAL_FLOW);
     return runtime.requestJson(CHECKOUT_CONFIRM_ENDPOINT, {
       method: "POST",
       headers: accountHeaders(authenticated.accessToken, accountId, CHECKOUT_CONFIRM_ENDPOINT, {
@@ -305,8 +408,10 @@ class ChatGptTrialSubscriptionClient {
 
   async prepare({
     taskId,
+    registration,
     accountSession,
     checkoutUrl,
+    checkoutEvidence,
     cardProfile,
     cardBinding,
     proxy,
@@ -319,6 +424,9 @@ class ChatGptTrialSubscriptionClient {
     requireBoundDefaultCard(cardBinding);
     const session = normalizeAccountSession(accountSession);
     const reference = extractCheckoutReference(checkoutUrl);
+    const bangKaProtocol = reference.sessionKind === "oaics"
+      && checkoutEvidence && checkoutEvidence.protocolMode === "bangka_oaics";
+    const promotionEvidence = bangKaProtocol ? null : normalizeCheckoutPromotionEvidence(checkoutEvidence, reference);
     const billing = normalizeCardProfile(cardProfile);
     const stickyProxy = createStickyProxySession(proxy, {
       sessionId: this.proxySessionId || crypto.randomBytes(4).toString("hex")
@@ -353,13 +461,154 @@ class ChatGptTrialSubscriptionClient {
         if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
       }
 
+      if (bangKaProtocol) {
+        const paymentMethodRoute = `${PAYMENT_METHODS_ENDPOINT}?${new URLSearchParams({ account_id: accountId })}`;
+        const methodsPayload = await runtime.requestJson(paymentMethodRoute, {
+          headers: accountHeaders(authenticated.accessToken, accountId, PAYMENT_METHODS_ENDPOINT),
+          stage: "Default payment-method verification"
+        });
+        const paymentMethodId = defaultPaymentMethod(methodsPayload, cardBinding);
+        const publishableKey = String(checkoutEvidence && checkoutEvidence.stripePublishableKey || "").trim();
+        if (!/^pk_(?:live|test)_[A-Za-z0-9]+$/.test(publishableKey)) {
+          throw new AppError(409, "TRIAL_STRIPE_KEY_REQUIRED", "The extracted Checkout is missing its Stripe publishable key.");
+        }
+        const checkoutEmail = String(registration && registration.email
+          || authenticated.session && authenticated.session.user && authenticated.session.user.email
+          || "").trim();
+        if (!checkoutEmail || !checkoutEmail.includes("@")) {
+          throw new AppError(409, "TRIAL_CHECKOUT_EMAIL_REQUIRED", "The account email is required for Checkout taxes.");
+        }
+        const currency = String(checkoutEvidence.currency || BANGKA_CHECKOUT_CONFIG.currency).trim().toLowerCase();
+        await reportProgress("默认卡已复查，正在通过 US 写入 Taxes 并验证实时金额为 0");
+        const taxesPayload = await runtime.requestJson(CHECKOUT_TAXES_ENDPOINT, {
+          method: "POST",
+          headers: accountHeaders(authenticated.accessToken, accountId, CHECKOUT_TAXES_ENDPOINT, {
+            "Content-Type": "application/json",
+            Referer: reference.url
+          }),
+          body: buildTaxesBody({
+            checkoutSessionId: reference.checkoutSessionId,
+            checkoutEmail,
+            processorEntity: reference.processorEntity,
+            currency,
+            billing
+          }),
+          stage: "US checkout taxes"
+        });
+        const taxes = parseTaxesContext(taxesPayload, currency);
+        verifiedCheckout = Object.freeze({
+          status: "open",
+          paymentStatus: "unpaid",
+          promotionId: String(checkoutEvidence.campaignId || BANGKA_CHECKOUT_CONFIG.campaignId),
+          discountPercent: 100,
+          dueTodayMinorUnits: 0,
+          taxMinorUnits: 0,
+          taxRatePercent: 0,
+          taxLabels: Object.freeze([]),
+          canConfirm: true,
+          requiresManualApproval: false,
+          paymentMethodTypes: taxes.paymentMethodTypes,
+          billing
+        });
+        await runtime.installCheckoutStripeBridge();
+        await runtime.navigateCheckout(reference.url);
+        const confirmation = await runtime.createBangKaConfirmationToken({
+          publishableKey,
+          customerSessionClientSecret: taxes.customerSessionClientSecret,
+          amount: taxes.amount,
+          currency: taxes.currency,
+          paymentMethodTypes: taxes.paymentMethodTypes,
+          paymentMethodId,
+          email: checkoutEmail
+        });
+        await reportProgress("Taxes 实时金额 0 与 Stripe.js ConfirmationToken 已就绪，等待同步释放", {
+          protocolMode: "bangka_oaics",
+          amountSource: taxes.amountSource,
+          paymentMethodTypes: taxes.paymentMethodTypes,
+          customPaymentMethodCount: taxes.customPaymentMethodCount
+        });
+        return {
+          [PREPARED_SUBSCRIPTION]: this,
+          runtime,
+          taskId,
+          session,
+          authenticated,
+          accountId,
+          reference,
+          verifiedCheckout,
+          billing,
+          paymentMethodId,
+          stripePublishableKey: publishableKey,
+          confirmationMode: "bangka_oaics",
+          confirmation,
+          reportProgress,
+          recoveredResult: null,
+          requiresConfirmation: true,
+          sentinelHeaders: null,
+          armed: false,
+          closed: false
+        };
+      }
+
       await runtime.installCheckoutStripeBridge();
       await runtime.navigateCheckout(reference.url);
+      if (reference.sessionKind === "standard") {
+        if (typeof runtime.waitForCheckoutCustomSession !== "function"
+            || typeof runtime.updateCustomCheckoutBilling !== "function"
+            || typeof runtime.confirmCustomCheckout !== "function") {
+          throw new AppError(503, "CHECKOUT_CUSTOM_RUNTIME_UNAVAILABLE", "Stripe Custom Checkout support is not initialized.");
+        }
+        const initialLive = await runtime.waitForCheckoutCustomSession(this.paymentElementWaitMs);
+        const campaignId = promotionEvidence && promotionEvidence.campaignId || "";
+        const initial = customCheckoutSummary(initialLive, campaignId);
+        assertTrialCheckout(initial, { manualApprovalConfirmed: confirmed === true });
+        await reportProgress("Stripe Custom Checkout has verified zero due today; applying the US billing address.", {
+          promotionId: campaignId,
+          promotionVerification: "stripe_custom_checkout",
+          discountPercent: initial.discountPercent,
+          dueTodayMinorUnits: initial.dueTodayMinorUnits
+        });
+
+        const billedLive = await runtime.updateCustomCheckoutBilling(billing);
+        const billed = customCheckoutSummary(billedLive, campaignId);
+        assertTrialCheckout(billed, { manualApprovalConfirmed: confirmed === true });
+        assertUsZeroTax(billed, billing);
+
+        const methodsRoute = `${PAYMENT_METHODS_ENDPOINT}?${new URLSearchParams({ account_id: accountId })}`;
+        const methodsPayload = await runtime.requestJson(methodsRoute, {
+          headers: accountHeaders(authenticated.accessToken, accountId, PAYMENT_METHODS_ENDPOINT),
+          stage: "Default payment-method verification"
+        });
+        const paymentMethodId = defaultPaymentMethod(methodsPayload, cardBinding);
+        verifiedCheckout = billed;
+        await reportProgress("The live Checkout remains zero due after US billing, and the verified default card is ready for synchronized release.");
+        return {
+          [PREPARED_SUBSCRIPTION]: this,
+          runtime,
+          taskId,
+          session,
+          authenticated,
+          accountId,
+          reference,
+          verifiedCheckout,
+          billing,
+          paymentMethodId,
+          confirmationMode: "stripe_custom_checkout",
+          confirmation: null,
+          reportProgress,
+          recoveredResult: null,
+          requiresConfirmation: true,
+          sentinelHeaders: null,
+          armed: false,
+          closed: false
+        };
+      }
       const initialPayload = await this.readCheckout(runtime, authenticated, accountId, reference);
-      const initial = summarizeCheckout(initialPayload);
+      const initial = summarizeCheckoutWithEvidence(initialPayload, promotionEvidence);
       assertTrialCheckout(initial, { manualApprovalConfirmed: confirmed === true });
       await reportProgress("The promoted Checkout and default card are confirmed; writing the US billing snapshot.", {
-        promotionId: initial.promotionId
+        promotionId: initial.promotionId,
+        promotionVerification: promotionEvidence && promotionEvidence.promotionVerification || "checkout_detail"
       });
 
       await runtime.requestJson(CHECKOUT_SNAPSHOT_ENDPOINT, {
@@ -382,7 +631,7 @@ class ChatGptTrialSubscriptionClient {
       for (let attempt = 0; attempt < this.billingAttempts; attempt += 1) {
         if (attempt > 0 && this.pollDelayMs) await this.sleep(this.pollDelayMs * attempt);
         const payload = await this.readCheckout(runtime, authenticated, accountId, reference);
-        const summary = summarizeCheckout(payload);
+        const summary = summarizeCheckoutWithEvidence(payload, promotionEvidence);
         try {
           assertTrialCheckout(summary, { manualApprovalConfirmed: confirmed === true });
           assertUsZeroTax(summary, billing, { billingSnapshotAccepted: true });
@@ -434,6 +683,8 @@ class ChatGptTrialSubscriptionClient {
         accountId,
         reference,
         verifiedCheckout,
+        billing,
+        confirmationMode: "oaics",
         confirmation,
         reportProgress,
         recoveredResult: null,
@@ -452,6 +703,13 @@ class ChatGptTrialSubscriptionClient {
   async armPrepared(prepared) {
     const handle = this.assertPrepared(prepared);
     if (!handle.requiresConfirmation || handle.armed) return handle;
+    if (["stripe_custom_checkout", "bangka_oaics"].includes(handle.confirmationMode)) {
+      handle.armed = true;
+      await handle.reportProgress(handle.confirmationMode === "bangka_oaics"
+        ? "Taxes、默认卡和 ConfirmationToken 已就绪，等待同步释放。"
+        : "Stripe Custom Checkout is armed with the verified default card and waiting for synchronized release.");
+      return handle;
+    }
     handle.sentinelHeaders = await handle.runtime.acquireSentinelHeaders(CHECKOUT_APPROVAL_FLOW);
     handle.armed = true;
     await handle.reportProgress("The Sentinel approval headers are armed and waiting for synchronized confirm release.");
@@ -461,7 +719,7 @@ class ChatGptTrialSubscriptionClient {
   async confirmPrepared(prepared) {
     const handle = this.assertPrepared(prepared);
     if (handle.recoveredResult) return { recoveredResult: handle.recoveredResult };
-    if (!handle.armed || !handle.sentinelHeaders) {
+    if (!handle.armed || (!["stripe_custom_checkout", "bangka_oaics"].includes(handle.confirmationMode) && !handle.sentinelHeaders)) {
       throw new AppError(409, "TRIAL_SUBSCRIPTION_NOT_ARMED", "The prepared subscription is not armed for synchronized confirmation.");
     }
     const {
@@ -474,11 +732,18 @@ class ChatGptTrialSubscriptionClient {
       reportProgress
     } = handle;
     try {
+      if (handle.confirmationMode === "stripe_custom_checkout") {
+        const customConfirmation = await runtime.confirmCustomCheckout({
+          paymentMethodId: handle.paymentMethodId,
+          billing: handle.billing
+        });
+        return { customConfirmation };
+      }
       let confirmedCheckout = await this.postConfirm(runtime, authenticated, accountId, {
         checkout_session_id: reference.checkoutSessionId,
         confirm_token: confirmation.token,
         selected_payment_method_type: confirmation.selectedPaymentMethodType
-      }, handle.sentinelHeaders);
+      }, handle.confirmationMode === "bangka_oaics" ? false : handle.sentinelHeaders);
       if (confirmFailure(confirmedCheckout)) {
         const uiObservation = await this.observeRejectedCheckout(runtime, taskId, reportProgress);
         throw new AppError(
@@ -489,7 +754,8 @@ class ChatGptTrialSubscriptionClient {
         );
       }
 
-      if (confirmedCheckout && confirmedCheckout.conditional_offer_preflight === true
+      if (handle.confirmationMode !== "bangka_oaics"
+          && confirmedCheckout && confirmedCheckout.conditional_offer_preflight === true
           && String(confirmedCheckout.type || "").toLowerCase() === "setup_intent") {
         const preflightSecret = clientSecretFrom(confirmedCheckout);
         if (!preflightSecret) {
@@ -509,7 +775,31 @@ class ChatGptTrialSubscriptionClient {
           );
         }
       }
-      return { confirmedCheckout };
+      let stripeConfirmation = null;
+      if (handle.confirmationMode === "bangka_oaics") {
+        const confirmationSecret = clientSecretFrom(confirmedCheckout);
+        if (!confirmationSecret) {
+          throw new AppError(502, "TRIAL_CONFIRM_SECRET_MISSING", "Checkout confirmation did not return a valid client secret.");
+        }
+        const stripeInput = {
+          type: confirmedCheckout.type,
+          clientSecret: confirmationSecret,
+          confirmationToken: confirmation.token,
+          publishableKey: handle.stripePublishableKey,
+          checkoutSessionId: reference.checkoutSessionId,
+          processorEntity: reference.processorEntity,
+          paymentMethodId: handle.paymentMethodId,
+          planType: "plus"
+        };
+        stripeConfirmation = typeof runtime.confirmBangKaStripeIntent === "function"
+          ? await runtime.confirmBangKaStripeIntent(stripeInput)
+          : await runtime.confirmStripeIntent(stripeInput);
+        await reportProgress("同步释放已连续完成 ChatGPT confirm 与 Stripe intent confirm。", {
+          protocolMode: "bangka_oaics",
+          stripeStatus: stripeConfirmation.status
+        });
+      }
+      return { confirmedCheckout, stripeConfirmation };
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError(502, "TRIAL_SUBSCRIPTION_CONFIRM_FAILED", error && error.message || "Trial subscription confirmation failed.");
@@ -531,12 +821,13 @@ class ChatGptTrialSubscriptionClient {
       reportProgress
     } = handle;
     const confirmedCheckout = confirmationResult.confirmedCheckout;
-    if (!confirmedCheckout) {
+    const customConfirmation = confirmationResult.customConfirmation;
+    if (!confirmedCheckout && !customConfirmation) {
       throw new AppError(502, "TRIAL_SUBSCRIPTION_CONFIRM_RESULT_MISSING", "The synchronized confirmation did not return a checkout result.");
     }
     try {
-      const confirmationSecret = clientSecretFrom(confirmedCheckout);
-      if (confirmationSecret) {
+      const confirmationSecret = confirmedCheckout && clientSecretFrom(confirmedCheckout);
+      if (confirmationSecret && handle.confirmationMode !== "bangka_oaics") {
         await runtime.confirmStripeIntent({
           type: confirmedCheckout.type,
           clientSecret: confirmationSecret,
@@ -594,6 +885,8 @@ module.exports = {
   assertTrialCheckout,
   assertUsZeroTax,
   extractCheckoutReference,
+  normalizeCheckoutPromotionEvidence,
   summarizeCheckout,
+  summarizeCheckoutWithEvidence,
   summarizeEntitlement
 };

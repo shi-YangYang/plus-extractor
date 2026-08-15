@@ -18,8 +18,16 @@ const { ChatGptCardBindingClient } = require("./services/chatgpt-card-binding-cl
 const { ChatGptTrialSubscriptionClient } = require("./services/chatgpt-trial-subscription-client");
 const { ProfileAddressGenerator } = require("./services/profile-address-generator");
 const { AccountExportService } = require("./services/account-export-service");
+const { OperationSettingsService } = require("./services/operation-settings-service");
+const { RoxyBrowserBridge } = require("./services/roxy-browser-bridge");
+const { ChatGptRoxyRegistrationClient } = require("./services/chatgpt-roxy-registration-client");
+const {
+  MAX_PLUS_VERIFY_CONCURRENCY,
+  MAX_PLUS_VERIFY_ITEMS,
+  PlusEntitlementVerifier
+} = require("./services/plus-entitlement-verifier");
 
-const MAX_BODY_BYTES = 1_000_000;
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:17891",
   "http://localhost:17891"
@@ -97,14 +105,31 @@ function applyCors(request, response) {
 async function createApplication(options = {}) {
   const dataDirectory = path.resolve(options.dataDirectory || process.env.LOCAL_WEB_DATA_DIR || path.join(__dirname, "../data"));
   const sessionDirectory = path.join(dataDirectory, "sessions");
-  const proxyPools = new ProxyPoolService(new JsonStore(path.join(dataDirectory, "proxy-pools.json"), { US: "", TR: "" }));
+  const proxyPools = new ProxyPoolService(new JsonStore(path.join(dataDirectory, "proxy-pools.json"), { REGISTRATION: "", US: "", TR: "" }));
   await proxyPools.init();
+
+  const operationSettings = options.operationSettings || new OperationSettingsService(
+    new JsonStore(path.join(dataDirectory, "operation-settings.json"), {
+      maxAccountOperations: 10,
+      registrationMode: "protocol"
+    })
+  );
+  if (typeof operationSettings.init === "function") await operationSettings.init();
+  const roxyBrowserBridge = Object.hasOwn(options, "roxyBrowserBridge")
+    ? options.roxyBrowserBridge
+    : new RoxyBrowserBridge(options.roxyBrowserOptions);
 
   const registrationClient = Object.hasOwn(options, "registrationClient")
     ? options.registrationClient
     : Object.hasOwn(options, "registrationDriver")
     ? options.registrationDriver
     : new ChatGptProtocolRegistrationClient({
+      sessionDirectory
+    });
+  const roxyRegistrationClient = Object.hasOwn(options, "roxyRegistrationClient")
+    ? options.roxyRegistrationClient
+    : new ChatGptRoxyRegistrationClient({
+      bridge: roxyBrowserBridge,
       sessionDirectory
     });
   const checkoutClient = Object.hasOwn(options, "checkoutClient")
@@ -122,22 +147,32 @@ async function createApplication(options = {}) {
   const accountExportClient = Object.hasOwn(options, "accountExportClient")
     ? options.accountExportClient
     : new AccountExportService({ sessionDirectory });
+  let tasks = null;
+  const plusEntitlementVerifier = Object.hasOwn(options, "plusEntitlementVerifier")
+    ? options.plusEntitlementVerifier
+    : new PlusEntitlementVerifier({
+      proxyPools,
+      savedSessionResolver: (normalized) => tasks && tasks.resolveSavedBrowserSession(normalized)
+    });
   const adapters = {
     registration: new RegistrationAdapter({
       mailboxReader: options.mailboxReader,
-      registrationClient
+      protocolRegistrationClient: registrationClient,
+      roxyRegistrationClient
     }),
     checkoutLink: new CheckoutLinkAdapter({ checkoutClient }),
     cardBinding: new CardBindingAdapter({ cardBindingClient }),
     trialPayment: new TrialPaymentAdapter({ trialPaymentClient })
   };
-  const tasks = new TaskOrchestrator({
+  tasks = new TaskOrchestrator({
     store: new JsonStore(path.join(dataDirectory, "tasks.json"), { tasks: [] }),
     proxyPools,
     adapters,
     profileAddressGenerator,
     sessionDirectory,
     accountExportClient,
+    accountSessionImporter: plusEntitlementVerifier,
+    operationSettings,
     sleep: options.taskSleep,
     batchRetryDelayMs: options.batchRetryDelayMs
   });
@@ -163,6 +198,9 @@ async function createApplication(options = {}) {
       }
 
       if (request.method === "GET" && url.pathname === "/api/bootstrap") {
+        const roxyBrowser = roxyBrowserBridge && typeof roxyBrowserBridge.status === "function"
+          ? await roxyBrowserBridge.status()
+          : { ready: false, availableProfiles: 0, openedProfiles: 0, accountsPerWindow: 2, maxWindows: 15 };
         sendJson(response, 200, {
           ok: true,
           deprecatedPlugin: true,
@@ -170,7 +208,14 @@ async function createApplication(options = {}) {
           pipeline: tasks.pipeline(),
           adapters: tasks.adapterStatus(),
           accountExport: { formats: ["email_url", "access_token"], maxBatchSize: 500 },
+          plusVerification: {
+            inputFormat: "session_jsonl_or_access_token",
+            maxBatchSize: MAX_PLUS_VERIFY_ITEMS,
+            concurrency: MAX_PLUS_VERIFY_CONCURRENCY
+          },
           batch: tasks.batchConfiguration(),
+          operationSettings: operationSettings.summary(),
+          roxyBrowser,
           tasks: tasks.list()
         });
         return;
@@ -181,9 +226,34 @@ async function createApplication(options = {}) {
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/api/operation-settings") {
+        sendJson(response, 200, {
+          ok: true,
+          settings: operationSettings.summary(),
+          roxyBrowser: roxyBrowserBridge && typeof roxyBrowserBridge.status === "function"
+            ? await roxyBrowserBridge.status()
+            : { ready: false, availableProfiles: 0, openedProfiles: 0, accountsPerWindow: 2, maxWindows: 15 }
+        });
+        return;
+      }
+
+      if (request.method === "PUT" && url.pathname === "/api/operation-settings") {
+        const body = await readJson(request);
+        const settings = await operationSettings.replace(body);
+        sendJson(response, 200, {
+          ok: true,
+          settings,
+          batch: tasks.batchConfiguration(),
+          roxyBrowser: roxyBrowserBridge && typeof roxyBrowserBridge.status === "function"
+            ? await roxyBrowserBridge.status()
+            : { ready: false, availableProfiles: 0, openedProfiles: 0, accountsPerWindow: 2, maxWindows: 15 }
+        });
+        return;
+      }
+
       if (request.method === "PUT" && url.pathname === "/api/proxy-pools") {
         const body = await readJson(request);
-        const summary = await proxyPools.replace({ US: body.US, TR: body.TR });
+        const summary = await proxyPools.replace(body);
         sendJson(response, 200, { ok: true, proxyPools: summary });
         return;
       }
@@ -196,9 +266,18 @@ async function createApplication(options = {}) {
 
       if (request.method === "POST" && url.pathname === "/api/mailbox/probe") {
         const body = await readJson(request);
-        const proxy = proxyPools.select("US", Number(body.proxyIndex) || 0);
+        const proxy = proxyPools.select("REGISTRATION", Number(body.proxyIndex) || 0);
         const mailbox = await adapters.registration.probe({ ...body, proxy });
         sendJson(response, 200, { ok: true, mailbox });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/plus-verification") {
+        const body = await readJson(request);
+        sendJson(response, 200, {
+          ok: true,
+          verification: await plusEntitlementVerifier.verifyBatch(body)
+        });
         return;
       }
 
@@ -267,6 +346,12 @@ async function createApplication(options = {}) {
         return;
       }
 
+      const terminateMatch = url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/terminate$/i);
+      if (request.method === "POST" && terminateMatch) {
+        sendJson(response, 202, { ok: true, termination: await tasks.terminate(terminateMatch[1]) });
+        return;
+      }
+
       const runMatch = url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/run$/i);
       if (request.method === "POST" && runMatch) {
         const body = await readJson(request);
@@ -320,7 +405,17 @@ async function createApplication(options = {}) {
 
   return {
     handler,
-    services: { proxyPools, tasks, profileAddressGenerator, cardBindingClient, trialPaymentClient, accountExportClient },
+    services: {
+      proxyPools,
+      operationSettings,
+      roxyBrowserBridge,
+      tasks,
+      profileAddressGenerator,
+      cardBindingClient,
+      trialPaymentClient,
+      accountExportClient,
+      plusEntitlementVerifier
+    },
     createServer: () => http.createServer(handler)
   };
 }

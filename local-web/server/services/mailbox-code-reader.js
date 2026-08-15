@@ -11,6 +11,30 @@ const MAILBOX_PROVIDER = Object.freeze({
   "icloud-api.top": "share_path"
 });
 
+function terminationError(signal) {
+  if (signal && signal.reason instanceof AppError) return signal.reason;
+  return new AppError(409, "TASK_TERMINATED", "The current task was terminated by the user.");
+}
+
+function throwIfTerminated(signal) {
+  if (signal && signal.aborted) throw terminationError(signal);
+}
+
+async function waitWithSignal(promise, signal) {
+  throwIfTerminated(signal);
+  if (!signal) return promise;
+  let onAbort;
+  const aborted = new Promise((resolve, reject) => {
+    onAbort = () => reject(terminationError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 function decodeHtml(text) {
   const named = {
     amp: "&",
@@ -239,20 +263,24 @@ class MailboxCodeReader {
     let lastError = null;
     const attempts = Math.max(1, Math.min(Number(input.requestAttempts) || 3, 3));
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      throwIfTerminated(input.signal);
       try {
-        response = await requestText(config.inboxUrl, rotateMailboxProxySession(input.proxy), {
+        response = await waitWithSignal(requestText(config.inboxUrl, rotateMailboxProxySession(input.proxy), {
           timeoutMs: input.timeoutMs || 20_000,
           maxBytes: 2 * 1024 * 1024
-        });
+        }), input.signal);
         const status = Number(response && response.status) || 0;
         if ((status === 429 || status >= 500) && attempt + 1 < attempts) {
-          await this.sleep(1_500 * (attempt + 1));
+          await waitWithSignal(this.sleep(1_500 * (attempt + 1)), input.signal);
           continue;
         }
         break;
       } catch (error) {
+        if (error && error.code === "TASK_TERMINATED") throw error;
         lastError = error;
-        if (attempt + 1 < attempts) await this.sleep(1_500 * (attempt + 1));
+        if (attempt + 1 < attempts) {
+          await waitWithSignal(this.sleep(1_500 * (attempt + 1)), input.signal);
+        }
       }
     }
     if (!response) {
@@ -292,11 +320,13 @@ class MailboxCodeReader {
     let successfulSnapshots = 0;
     let lastTransientError = null;
     do {
+      throwIfTerminated(input.signal);
       try {
         const snapshot = await this.fetchSnapshot({
           ...config,
           proxy: input.proxy,
           requestText: input.requestText,
+          signal: input.signal,
           timeoutMs: Math.min(20_000, timeoutMs)
         });
         successfulSnapshots += 1;
@@ -312,7 +342,7 @@ class MailboxCodeReader {
         lastTransientError = error;
       }
       if (Date.now() >= deadline) break;
-      await this.sleep(Math.min(pollIntervalMs, deadline - Date.now()));
+      await waitWithSignal(this.sleep(Math.min(pollIntervalMs, deadline - Date.now())), input.signal);
     } while (Date.now() <= deadline);
     if (!successfulSnapshots && lastTransientError) {
       throw new AppError(

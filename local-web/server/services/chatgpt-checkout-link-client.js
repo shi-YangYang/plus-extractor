@@ -1,4 +1,4 @@
-"use strict";
+﻿"use strict";
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -10,6 +10,15 @@ const {
   findBrowserExecutable,
   parseTrace
 } = require("./chatgpt-protocol-registration-client");
+const {
+  BANGKA_CHECKOUT_CONFIG,
+  buildCheckoutCreateBody,
+  buildCheckoutUpdateBody,
+  extractCheckoutAmount: extractBangKaCheckoutAmount,
+  extractCheckoutSessionId: extractBangKaCheckoutSessionId,
+  extractProcessorEntity: extractBangKaProcessorEntity,
+  extractStripePublishableKey
+} = require("./chatgpt-bangka-protocol");
 
 const core = require(path.resolve(__dirname, "../../../chatgpt-checkout-helper/core.js"));
 
@@ -19,9 +28,14 @@ const CHECKOUT_ENDPOINT = "/backend-api/payments/checkout";
 const CHECKOUT_UPDATE_ENDPOINT = "/backend-api/payments/checkout/update";
 const ACCOUNT_CONTEXT_ENDPOINT = "/backend-api/accounts/check/v4-2023-04-27";
 const PAYMENT_METHODS_ENDPOINT = "/backend-api/payments/payment_methods";
+const PROMOTION_COUPON_ENDPOINTS = Object.freeze([
+  "/backend-api/payments/promo_campaign/check_coupon",
+  "/backend-api/promo_campaign/check_coupon"
+]);
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/backend-api/sentinel/sdk.js";
 const SENTINEL_FLOW = "chatgpt_checkout";
 const SENTINEL_FLOWS = new Set([SENTINEL_FLOW, "checkout_session_approval"]);
+const MAX_STORAGE_STATE_BYTES = 16 * 1024 * 1024;
 
 function loadChromium() {
   try {
@@ -43,7 +57,7 @@ function normalizeAccountSession(input) {
   } catch {
     throw new AppError(409, "ACCOUNT_SESSION_MISSING", "The saved browser session file is missing.");
   }
-  if (!stats.isFile() || stats.size < 2 || stats.size > 2 * 1024 * 1024) {
+  if (!stats.isFile() || stats.size < 2 || stats.size > MAX_STORAGE_STATE_BYTES) {
     throw new AppError(409, "ACCOUNT_SESSION_INVALID", "The saved browser session file is invalid.");
   }
   try {
@@ -52,7 +66,42 @@ function normalizeAccountSession(input) {
   } catch {
     throw new AppError(409, "ACCOUNT_SESSION_INVALID", "The saved browser session file is invalid.");
   }
-  return Object.freeze({ kind, path: sessionPath });
+  let importedAuthSession = null;
+  // Every registration path persists an adjacent auth-session cache. Protocol
+  // registrations previously supplied that path without either legacy mode
+  // flag, so checkout ignored the still-valid AT and relied only on cookies.
+  // Once those cookies rolled over, Plus verification reported an expired
+  // session even though the preserved AT remained valid.
+  const privateAuthCacheRequested = Boolean(input && (
+    String(input.authSessionPath || "").trim()
+    || input.accessTokenImported === true
+    || input.registrationMode === "roxybrowser"
+  ));
+  if (privateAuthCacheRequested) {
+    const authSessionPath = path.resolve(String(input.authSessionPath || ""));
+    const expectedAuthSessionPath = sessionPath.toLowerCase().endsWith(".storage.json")
+      ? sessionPath.slice(0, -".storage.json".length) + ".auth-session.json"
+      : "";
+    if (!authSessionPath || authSessionPath !== expectedAuthSessionPath
+        || !authSessionPath.toLowerCase().endsWith(".auth-session.json")) {
+      throw new AppError(409, "ACCOUNT_AUTH_SESSION_REQUIRED", "The private access token cache is missing.");
+    }
+    try {
+      const authStats = fs.statSync(authSessionPath);
+      if (!authStats.isFile() || authStats.size < 2 || authStats.size > 2 * 1024 * 1024) throw new Error("size");
+      const parsed = JSON.parse(fs.readFileSync(authSessionPath, "utf8"));
+      const accessToken = String(parsed && parsed.accessToken || "").trim();
+      const accountId = core.getSessionAccountId(parsed);
+      if (!accessToken || accessToken.length < 20 || accessToken.length > 20_000
+          || !/^[A-Za-z0-9._~+\/-]+=*$/.test(accessToken) || !accountId) {
+        throw new Error("shape");
+      }
+      importedAuthSession = parsed;
+    } catch {
+      throw new AppError(409, "ACCOUNT_AUTH_SESSION_INVALID", "The private access token cache is invalid.");
+    }
+  }
+  return Object.freeze({ kind, path: sessionPath, importedAuthSession });
 }
 
 function normalizeCheckoutProxies(input = {}) {
@@ -88,6 +137,72 @@ function authHeaders(accessToken, extra = {}) {
   };
 }
 
+function accountCheckoutHeaders(accessToken, accountId, route, extra = {}) {
+  const normalizedAccountId = typeof accountId === "string" ? accountId.trim() : "";
+  return authHeaders(accessToken, {
+    ...(normalizedAccountId ? { "chatgpt-account-id": normalizedAccountId } : {}),
+    "x-openai-target-path": route,
+    "x-openai-target-route": route,
+    ...extra
+  });
+}
+
+function extractAnyCheckoutSessionId(payload) {
+  return core.extractOpenAICheckoutSessionId(payload) || core.extractCheckoutSessionId(payload);
+}
+
+function extractCheckoutProcessorEntity(payload) {
+  const candidate = payload && (payload.processor_entity
+    || payload.processorEntity
+    || (payload.data && (payload.data.processor_entity || payload.data.processorEntity)));
+  const normalized = typeof candidate === "string" ? candidate.trim().toLowerCase() : "";
+  return /^(?:openai_llc|openai_ie)$/.test(normalized) ? normalized : "";
+}
+
+function checkoutProcessorEntity(payload) {
+  return extractCheckoutProcessorEntity(payload) || "openai_llc";
+}
+
+function summarizeCouponEligibility(payload) {
+  const rawStatus = [payload && payload.status, payload && payload.state, payload && payload.eligibility]
+    .find((value) => typeof value === "string");
+  const status = String(rawStatus || "").trim().toLowerCase();
+  const explicit = payload && typeof payload.eligible === "boolean"
+    ? payload.eligible
+    : payload && typeof payload.is_eligible === "boolean" ? payload.is_eligible : null;
+  const eligible = explicit === true || /^(?:eligible|available|active)$/.test(status);
+  const ineligible = explicit === false || /^(?:not_eligible|ineligible|unavailable|inactive)$/.test(status);
+  return Object.freeze({
+    known: eligible || ineligible,
+    eligible,
+    status: status || (explicit === true ? "eligible" : explicit === false ? "not_eligible" : "unknown")
+  });
+}
+
+function mergeSameSessionCheckout(baseline, update, expectedSessionId) {
+  if (!baseline || typeof baseline !== "object" || !update || typeof update !== "object") return null;
+  return {
+    ...baseline,
+    ...update,
+    checkout_session_id: expectedSessionId,
+    processor_entity: extractCheckoutProcessorEntity(update) || checkoutProcessorEntity(baseline)
+  };
+}
+
+function resolveInternalCheckout(payload) {
+  const checkoutUrl = core.buildInternalCheckoutUrl(payload);
+  const sessionId = extractAnyCheckoutSessionId(payload);
+  if (!checkoutUrl || !sessionId) return null;
+  const oaicsSessionId = core.extractOpenAICheckoutSessionId(payload);
+  return Object.freeze({
+    payload,
+    checkoutUrl,
+    route: "chatgpt_internal",
+    oaicsSessionId,
+    sessionKind: /^oaics_/i.test(sessionId) ? "oaics" : "standard"
+  });
+}
+
 function upstreamError(stage, status, payload, cloudflareChallenge = false) {
   if (cloudflareChallenge) {
     return new AppError(502, "CHECKOUT_CLOUDFLARE_CHALLENGE", `${stage} was challenged by Cloudflare.`);
@@ -95,6 +210,10 @@ function upstreamError(stage, status, payload, cloudflareChallenge = false) {
   if (status === 401) return new AppError(401, "CHECKOUT_SESSION_EXPIRED", "The saved ChatGPT session has expired.");
   if (status === 403) return new AppError(502, "CHECKOUT_REQUEST_REJECTED", `${stage} was rejected with HTTP 403.`);
   if (status === 429) return new AppError(429, "CHECKOUT_RATE_LIMITED", `${stage} was rate limited.`);
+  const detail = typeof (payload && payload.detail) === "string" ? payload.detail.trim() : "";
+  if (status === 400 && /no payment account exists for this account/i.test(detail)) {
+    return new AppError(409, "CHECKOUT_PAYMENT_ACCOUNT_MISSING", "The account payment profile has not been initialized.");
+  }
   const upstreamCode = payload && payload.error && payload.error.code;
   return new AppError(502, upstreamCode || "CHECKOUT_UPSTREAM_FAILED", `${stage} returned HTTP ${status || "unknown"}.`);
 }
@@ -139,6 +258,7 @@ class CheckoutProtocolRuntime {
       : process.env.LOCAL_WEB_CHECKOUT_HEADLESS === "1";
     this.timeoutMs = Number(options.timeoutMs) || 60_000;
     this.stealth = options.stealth !== false;
+    this.deviceId = String(options.deviceId || crypto.randomUUID());
     this.relayFactory = options.relayFactory || ((proxy) => new BrowserProxyRelay(proxy, options.relayOptions));
     this.relay = null;
     this.browser = null;
@@ -146,6 +266,7 @@ class CheckoutProtocolRuntime {
     this.page = null;
     this.proxyRegion = null;
     this.stripeBridgeInstalled = false;
+    this.importedAuthSession = null;
   }
 
   async open({ accountSession, proxy }) {
@@ -180,6 +301,7 @@ class CheckoutProtocolRuntime {
     }
     await this.createPage();
     this.proxyRegion = "US";
+    this.importedAuthSession = accountSession.importedAuthSession || null;
   }
 
   async createPage() {
@@ -206,8 +328,8 @@ class CheckoutProtocolRuntime {
   async navigateCheckout(checkoutUrl) {
     if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
     const target = new URL(String(checkoutUrl || ""));
-    if (target.origin !== CHATGPT_ORIGIN || !/^\/checkout\/[a-z0-9_]+\/oaics_[A-Za-z0-9_-]+\/?$/i.test(target.pathname)) {
-      throw new AppError(400, "CHECKOUT_URL_INVALID", "The checkout URL is not an official ChatGPT OAICS checkout.");
+    if (target.origin !== CHATGPT_ORIGIN || !/^\/checkout\/[a-z0-9_]+\/(?:oaics_[A-Za-z0-9_-]+|cs_(?:live|test)_[A-Za-z0-9_-]+)\/?$/i.test(target.pathname)) {
+      throw new AppError(400, "CHECKOUT_URL_INVALID", "The checkout URL is not an official ChatGPT checkout.");
     }
     let response;
     try {
@@ -233,11 +355,131 @@ class CheckoutProtocolRuntime {
     return Object.freeze({ status: response.status(), path: target.pathname });
   }
 
+  async createPromotedCheckoutFromPricing({ campaignId = core.CHECKOUT_CONFIG.campaignId } = {}) {
+    if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
+    const normalizedCampaignId = typeof campaignId === "string" ? campaignId.trim() : "";
+    if (!/^[A-Za-z0-9_.-]{2,120}$/.test(normalizedCampaignId)) {
+      throw new AppError(400, "CHECKOUT_PROMOTION_INVALID", "The promotion campaign id is invalid.");
+    }
+
+    const pricingUrl = new URL(CHATGPT_ORIGIN);
+    pricingUrl.searchParams.set("promo_campaign", normalizedCampaignId);
+    pricingUrl.hash = "pricing";
+    let response;
+    try {
+      response = await this.page.goto(pricingUrl.href, {
+        waitUntil: "domcontentloaded",
+        timeout: this.timeoutMs
+      });
+    } catch (error) {
+      throw new AppError(502, "CHECKOUT_PRICING_PAGE_FAILED", "The official promotion pricing page did not load.", error);
+    }
+    if (!response || response.status() >= 400) {
+      throw new AppError(502, "CHECKOUT_PRICING_PAGE_FAILED", `The official promotion pricing page returned HTTP ${response && response.status()}.`);
+    }
+
+    const offerButton = this.page.getByRole("button", {
+      name: /^(?:claim free offer|claim offer|start free trial|try plus)$/i
+    }).first();
+    try {
+      await offerButton.waitFor({ state: "visible", timeout: Math.min(this.timeoutMs, 30_000) });
+    } catch (error) {
+      throw new AppError(
+        409,
+        "CHECKOUT_PROMOTION_OFFER_NOT_VISIBLE",
+        "The official pricing page does not show a free Plus offer for this account.",
+        error
+      );
+    }
+
+    const evidence = await offerButton.evaluate((button) => {
+      const bodyText = String(document.body && document.body.innerText || "").replace(/\r/g, "");
+      const buttonText = String(button && button.textContent || "").trim();
+      const plusVisible = /(?:^|\n)(?:ChatGPT\s+)?Plus(?:\n|$)/i.test(bodyText);
+      const freeOfferVisible = /claim\s+(?:free\s+)?offer|start\s+free\s+trial|try\s+plus/i.test(buttonText);
+      const zeroPriceVisible = /(?:\$|USD\s*)\s*0(?:\.00)?(?:\s|\n|\/|$)/i.test(bodyText)
+        || /0(?:\.00)?\s*USD/i.test(bodyText)
+        || /^claim\s+free\s+offer$/i.test(buttonText);
+      const firstMonthVisible = /first\s+month|promo\s+pricing\s+applies\s+for\s+1\s+month|free\s+offer/i.test(bodyText);
+      const priceMatch = bodyText.match(/\$\s*(\d+(?:\.\d{1,2})?)\s*\n\s*\$\s*0(?:\.00)?/i);
+      const subtotalMinorUnits = priceMatch ? Math.round(Number(priceMatch[1]) * 100) : null;
+      return {
+        plusVisible,
+        freeOfferVisible,
+        zeroPriceVisible,
+        firstMonthVisible,
+        subtotalMinorUnits: Number.isFinite(subtotalMinorUnits) ? subtotalMinorUnits : null
+      };
+    });
+    if (!evidence.plusVisible || !evidence.freeOfferVisible || !evidence.zeroPriceVisible || !evidence.firstMonthVisible) {
+      throw new AppError(
+        409,
+        "CHECKOUT_PROMOTION_PRICE_NOT_VERIFIED",
+        `The official pricing page did not verify a zero-price first month for Plus (plus=${evidence.plusVisible}, offer=${evidence.freeOfferVisible}, zero=${evidence.zeroPriceVisible}, firstMonth=${evidence.firstMonthVisible}).`
+      );
+    }
+
+    const checkoutResponsePromise = this.page.waitForResponse((candidate) => {
+      try {
+        const target = new URL(candidate.url());
+        return candidate.request().method() === "POST"
+          && target.origin === CHATGPT_ORIGIN
+          && target.pathname === CHECKOUT_ENDPOINT;
+      } catch {
+        return false;
+      }
+    }, { timeout: Math.min(this.timeoutMs, 45_000) });
+    await offerButton.click({ timeout: Math.min(this.timeoutMs, 30_000) });
+    const checkoutResponse = await checkoutResponsePromise;
+    let checkoutPayload = {};
+    try {
+      checkoutPayload = await checkoutResponse.json();
+    } catch {
+      throw new AppError(502, "CHECKOUT_UPSTREAM_FAILED", "The official pricing flow returned a non-JSON Checkout response.");
+    }
+    if (!checkoutResponse.ok()) {
+      throw upstreamError("Official pricing Checkout", checkoutResponse.status(), checkoutPayload);
+    }
+
+    const payloadResolved = resolveInternalCheckout(checkoutPayload) || resolveNavigableCheckout(checkoutPayload);
+    try {
+      await this.page.waitForURL((url) => (
+        url.origin === CHATGPT_ORIGIN
+        && /^\/checkout\/[a-z0-9_]+\/(?:oaics_[A-Za-z0-9_-]+|cs_(?:live|test)_[A-Za-z0-9_-]+)\/?$/i.test(url.pathname)
+      ), { timeout: Math.min(this.timeoutMs, 30_000) });
+    } catch {}
+    let checkoutUrl = "";
+    try {
+      const current = new URL(this.page.url());
+      if (current.origin === CHATGPT_ORIGIN
+          && /^\/checkout\/[a-z0-9_]+\/(?:oaics_[A-Za-z0-9_-]+|cs_(?:live|test)_[A-Za-z0-9_-]+)\/?$/i.test(current.pathname)) {
+        checkoutUrl = current.href;
+      }
+    } catch {}
+    checkoutUrl = checkoutUrl || (payloadResolved && payloadResolved.checkoutUrl) || "";
+    if (!checkoutUrl) {
+      throw new AppError(502, "CHECKOUT_URL_MISSING", "The official pricing flow did not return a navigable Checkout URL.");
+    }
+
+    const subtotalMinorUnits = evidence.subtotalMinorUnits;
+    return Object.freeze({
+      checkout: checkoutPayload,
+      checkoutUrl,
+      fullDiscount: Object.freeze({
+        fullDiscountVerified: true,
+        discountPercent: 100,
+        subtotalMinorUnits,
+        discountMinorUnits: subtotalMinorUnits,
+        dueTodayMinorUnits: 0
+      })
+    });
+  }
+
   async refreshCheckout(checkoutUrl) {
     if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
     const target = new URL(String(checkoutUrl || ""));
-    if (target.origin !== CHATGPT_ORIGIN || !/^\/checkout\/[a-z0-9_]+\/oaics_[A-Za-z0-9_-]+\/?$/i.test(target.pathname)) {
-      throw new AppError(400, "CHECKOUT_URL_INVALID", "The checkout URL is not an official ChatGPT OAICS checkout.");
+    if (target.origin !== CHATGPT_ORIGIN || !/^\/checkout\/[a-z0-9_]+\/(?:oaics_[A-Za-z0-9_-]+|cs_(?:live|test)_[A-Za-z0-9_-]+)\/?$/i.test(target.pathname)) {
+      throw new AppError(400, "CHECKOUT_URL_INVALID", "The checkout URL is not an official ChatGPT checkout.");
     }
     let current = null;
     try { current = new URL(this.page.url()); } catch {}
@@ -292,6 +534,7 @@ class CheckoutProtocolRuntime {
       const bridge = {
         instances: [],
         elementsCalls: [],
+        checkoutCalls: [],
         created: [],
         errors: []
       };
@@ -367,6 +610,12 @@ class CheckoutProtocolRuntime {
             }
             const value = Reflect.get(target, property, target);
             if (typeof value !== "function") return value;
+            if (property === "initCheckout") {
+              return (...args) => Promise.resolve(value.apply(target, args)).then((checkout) => {
+                bridge.checkoutCalls.push({ stripe, checkout, stripeProxy, readyAt: Date.now() });
+                return checkout;
+              });
+            }
             if (["createConfirmationToken", "confirmPayment", "confirmSetup"].includes(String(property))) {
               return (options) => value.call(target, unwrapElements(options));
             }
@@ -435,6 +684,170 @@ class CheckoutProtocolRuntime {
     return Object.freeze({ ready: true });
   }
 
+  async waitForCheckoutCustomSession(timeoutMs = this.timeoutMs) {
+    if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
+    const result = await this.page.evaluate(async ({ timeoutMs: waitMs }) => {
+      const summarize = (session) => {
+        const amount = (value) => {
+          const number = Number(value);
+          return Number.isFinite(number) ? number : null;
+        };
+        const discounts = Array.isArray(session && session.discountAmounts) ? session.discountAmounts : [];
+        const taxes = Array.isArray(session && session.taxAmounts) ? session.taxAmounts : [];
+        const saved = Array.isArray(session && session.savedPaymentMethods) ? session.savedPaymentMethods : [];
+        const discountPercent = discounts.reduce((maximum, item) => (
+          Math.max(maximum, Number(item && item.percentOff) || 0)
+        ), 0);
+        const discountMinorUnits = discounts.reduce((sum, item) => (
+          sum + (amount(item && item.amount && item.amount.minorUnitsAmount) ?? amount(item && item.minorUnitsAmount) ?? 0)
+        ), 0);
+        const taxMinorUnits = taxes.reduce((sum, item) => (
+          sum + (amount(item && item.amount && item.amount.minorUnitsAmount) ?? amount(item && item.minorUnitsAmount) ?? 0)
+        ), 0);
+        const taxLabels = [...new Set(taxes.map((item) => String(item && item.displayName || "").trim()).filter(Boolean))];
+        const taxRatePercent = taxLabels.reduce((maximum, label) => {
+          for (const match of label.matchAll(/(\d+(?:\.\d+)?)\s*%/g)) {
+            maximum = Math.max(maximum, Number(match[1]) || 0);
+          }
+          return maximum;
+        }, 0);
+        const dueTodayMinorUnits = amount(session && session.total && session.total.total
+          && session.total.total.minorUnitsAmount);
+        const subtotalMinorUnits = amount(session && session.total && session.total.subtotal
+          && session.total.subtotal.minorUnitsAmount);
+        const billing = session && session.billingAddress || {};
+        const address = billing.address || {};
+        const statusValue = session && session.status;
+        return {
+          status: typeof statusValue === "string"
+            ? statusValue
+            : String(statusValue && (statusValue.type || statusValue.status) || ""),
+          discountPercent,
+          discountMinorUnits,
+          subtotalMinorUnits,
+          dueTodayMinorUnits,
+          taxMinorUnits,
+          taxRatePercent,
+          taxLabels,
+          canConfirm: session && session.canConfirm === true,
+          savedPaymentMethodCount: saved.length,
+          billing: {
+            name: String(billing.name || "").trim(),
+            address: {
+              line1: String(address.line1 || "").trim(),
+              city: String(address.city || "").trim(),
+              state: String(address.state || "").trim().toUpperCase(),
+              postal_code: String(address.postal_code || address.postalCode || "").trim(),
+              country: String(address.country || "").trim().toUpperCase()
+            }
+          }
+        };
+      };
+      const deadline = Date.now() + waitMs;
+      while (Date.now() < deadline) {
+        if (location.pathname === "/checkout/verify") return { expired: true, path: location.pathname };
+        const calls = window.__plusExtractorStripeBridge && window.__plusExtractorStripeBridge.checkoutCalls || [];
+        const call = [...calls].reverse().find((candidate) => (
+          candidate && candidate.checkout && typeof candidate.checkout.session === "function"
+        ));
+        if (call) {
+          window.__plusExtractorActiveCustomCheckout = call.checkout;
+          window.__plusExtractorSummarizeCustomCheckout = summarize;
+          return { ready: true, summary: summarize(call.checkout.session()) };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return {
+        ready: false,
+        path: location.pathname,
+        stripeInstanceCount: window.__plusExtractorStripeBridge && window.__plusExtractorStripeBridge.instances.length || 0
+      };
+    }, { timeoutMs: Math.max(1_000, Math.min(Number(timeoutMs) || this.timeoutMs, 90_000)) });
+    if (result && result.expired) {
+      throw new AppError(409, "TRIAL_CHECKOUT_SESSION_EXPIRED", "The saved Checkout session expired before its live amount could be verified.");
+    }
+    if (!result || result.ready !== true) {
+      throw new AppError(
+        502,
+        "CHECKOUT_CUSTOM_SESSION_NOT_READY",
+        `Stripe Custom Checkout did not initialize (path=${result && result.path || "unknown"}).`
+      );
+    }
+    return Object.freeze({
+      ...result.summary,
+      billing: Object.freeze({
+        ...result.summary.billing,
+        address: Object.freeze({ ...result.summary.billing.address })
+      })
+    });
+  }
+
+  async updateCustomCheckoutBilling(billing) {
+    if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
+    const result = await this.page.evaluate(async (input) => {
+      const checkout = window.__plusExtractorActiveCustomCheckout;
+      const summarize = window.__plusExtractorSummarizeCustomCheckout;
+      if (!checkout || typeof checkout.updateBillingAddress !== "function" || typeof summarize !== "function") {
+        return { error: { message: "Stripe Custom Checkout is not ready." } };
+      }
+      try {
+        const updated = await checkout.updateBillingAddress({ name: input.name, address: input.address });
+        if (updated && updated.type === "error") {
+          return { error: { message: String(updated.error && updated.error.message || "Billing update failed.").slice(0, 240) } };
+        }
+        return { summary: summarize(checkout.session()) };
+      } catch (error) {
+        return { error: { message: String(error && error.message || error).slice(0, 240) } };
+      }
+    }, billing);
+    if (!result || result.error || !result.summary) {
+      throw new AppError(502, "CHECKOUT_CUSTOM_BILLING_FAILED", result && result.error && result.error.message || "Stripe Custom Checkout billing update failed.");
+    }
+    return Object.freeze({
+      ...result.summary,
+      billing: Object.freeze({
+        ...result.summary.billing,
+        address: Object.freeze({ ...result.summary.billing.address })
+      })
+    });
+  }
+
+  async confirmCustomCheckout({ paymentMethodId, billing }) {
+    if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
+    const id = String(paymentMethodId || "").trim();
+    if (!/^pm_[A-Za-z0-9_-]{8,255}$/.test(id)) {
+      throw new AppError(409, "TRIAL_DEFAULT_CARD_REQUIRED", "The verified default payment method is missing.");
+    }
+    const result = await this.page.evaluate(async (input) => {
+      const checkout = window.__plusExtractorActiveCustomCheckout;
+      if (!checkout || typeof checkout.confirm !== "function") {
+        return { error: { message: "Stripe Custom Checkout is not ready.", code: "checkout_not_ready" } };
+      }
+      try {
+        const confirmed = await checkout.confirm({
+          paymentMethod: input.paymentMethodId,
+          redirect: "if_required"
+        });
+        if (confirmed && confirmed.type === "error") {
+          return { error: {
+            message: String(confirmed.error && confirmed.error.message || "Stripe confirmation failed.").slice(0, 240),
+            code: String(confirmed.error && confirmed.error.code || "").slice(0, 80),
+            type: String(confirmed.error && confirmed.error.type || "").slice(0, 80)
+          } };
+        }
+        return { type: String(confirmed && confirmed.type || "success") };
+      } catch (error) {
+        return { error: { message: String(error && error.message || error).slice(0, 240) } };
+      }
+    }, { paymentMethodId: id, billing });
+    if (!result || result.error) {
+      throw new AppError(409, "TRIAL_SUBSCRIPTION_REJECTED", result && result.error && result.error.message || "Stripe Custom Checkout rejected the subscription.", {
+        provider: result && result.error || null
+      });
+    }
+    return Object.freeze({ type: result.type || "success" });
+  }
+
   async createCheckoutConfirmationToken(billingDetails) {
     if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
     const result = await this.page.evaluate(async (input) => {
@@ -491,6 +904,140 @@ class CheckoutProtocolRuntime {
       throw new AppError(502, "CHECKOUT_CONFIRMATION_TOKEN_INVALID", "Stripe returned an invalid confirmation token.");
     }
     return Object.freeze({ token, selectedPaymentMethodType });
+  }
+
+  async createBangKaConfirmationToken({
+    publishableKey,
+    customerSessionClientSecret,
+    amount = 0,
+    currency,
+    paymentMethodTypes,
+    paymentMethodId,
+    email = ""
+  } = {}) {
+    if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
+    const result = await this.page.evaluate(async (input) => {
+      const safeError = (error) => ({
+        message: String(error && error.message || "Stripe confirmation-token request failed.").slice(0, 240),
+        code: String(error && error.code || "").slice(0, 80),
+        type: String(error && error.type || "").slice(0, 80)
+      });
+      const waitForStripe = async () => {
+        if (typeof window.Stripe === "function") return window.Stripe;
+        let script = document.querySelector('script[src^="https://js.stripe.com/v3"]');
+        if (!script) {
+          script = document.createElement("script");
+          script.src = "https://js.stripe.com/v3/";
+          script.async = true;
+          (document.head || document.documentElement).appendChild(script);
+        }
+        const deadline = Date.now() + input.timeoutMs;
+        while (Date.now() < deadline) {
+          if (typeof window.Stripe === "function") return window.Stripe;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error("Stripe.js did not load before the Payment Element deadline.");
+      };
+      let mount = null;
+      let paymentElement = null;
+      try {
+        const StripeFactory = await waitForStripe();
+        const stripe = StripeFactory(input.publishableKey);
+        const elements = stripe.elements({
+          mode: "subscription",
+          amount: input.amount,
+          currency: input.currency,
+          customerSessionClientSecret: input.customerSessionClientSecret,
+          paymentMethodTypes: input.paymentMethodTypes
+        });
+        paymentElement = elements.create("payment", {
+          fields: { billingDetails: { email: "never", phone: "never" } },
+          defaultValues: { billingDetails: { email: input.email } },
+          wallets: { applePay: "never", googlePay: "never" },
+          business: { name: "OpenAI" },
+          layout: { type: "accordion", defaultCollapsed: false }
+        });
+        mount = document.createElement("div");
+        mount.id = `plus-extractor-protocol-element-${Date.now()}`;
+        Object.assign(mount.style, {
+          position: "fixed",
+          left: "-10000px",
+          top: "0",
+          width: "420px",
+          minHeight: "240px",
+          opacity: "0.01",
+          pointerEvents: "none"
+        });
+        document.body.appendChild(mount);
+        let selectedPaymentMethodId = "";
+        let readyResolve;
+        let readyReject;
+        const ready = new Promise((resolve, reject) => {
+          readyResolve = resolve;
+          readyReject = reject;
+        });
+        paymentElement.on("ready", readyResolve);
+        paymentElement.on("loaderror", (event) => readyReject(event && event.error || new Error("Stripe Payment Element load failed.")));
+        paymentElement.on("change", (event) => {
+          const changedId = String(event && event.value && event.value.payment_method && event.value.payment_method.id || "").trim();
+          if (/^pm_/.test(changedId)) selectedPaymentMethodId = changedId;
+        });
+        paymentElement.mount(mount);
+        let timer;
+        await Promise.race([
+          ready,
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Stripe Payment Element load timed out.")), input.timeoutMs); })
+        ]).finally(() => { if (timer) clearTimeout(timer); });
+        const submitted = await elements.submit();
+        if (submitted && submitted.error) return { error: safeError(submitted.error) };
+        const submittedSelection = String(submitted && submitted.selectedPaymentMethod || "").trim();
+        let selectedPaymentMethodType = "";
+        if (/^pm_/.test(submittedSelection)) selectedPaymentMethodId = submittedSelection;
+        else selectedPaymentMethodType = submittedSelection;
+        if (selectedPaymentMethodType && selectedPaymentMethodType !== "card") {
+          return { error: safeError(Object.assign(new Error(`Stripe.js selected ${selectedPaymentMethodType} instead of card.`), { code: "unexpected_payment_method_type" })) };
+        }
+        if (selectedPaymentMethodId && selectedPaymentMethodId !== input.paymentMethodId) {
+          return { error: safeError(Object.assign(new Error("Stripe.js selected a different saved card."), { code: "payment_method_id_mismatch" })) };
+        }
+        const created = await stripe.createConfirmationToken({ elements });
+        if (created && created.error) return { error: safeError(created.error) };
+        return {
+          token: String(created && created.confirmationToken && created.confirmationToken.id || ""),
+          selectedPaymentMethodType: "card",
+          selectedPaymentMethodId
+        };
+      } catch (error) {
+        return { error: safeError(error) };
+      } finally {
+        try { if (paymentElement) paymentElement.destroy(); } catch {}
+        try { if (mount) mount.remove(); } catch {}
+      }
+    }, {
+      publishableKey,
+      customerSessionClientSecret,
+      amount: Number(amount),
+      currency: String(currency || "").toLowerCase(),
+      paymentMethodTypes: Array.isArray(paymentMethodTypes) ? paymentMethodTypes : ["card", "link"],
+      paymentMethodId,
+      email: String(email || "").trim(),
+      timeoutMs: Math.min(this.timeoutMs, 30_000)
+    });
+    if (result && result.error) {
+      const actionRequired = /auth|captcha|challenge|action/i.test(`${result.error.code} ${result.error.type} ${result.error.message}`);
+      throw new AppError(actionRequired ? 409 : 502,
+        actionRequired ? "TRIAL_SUBSCRIPTION_ACTION_REQUIRED" : "CHECKOUT_CONFIRMATION_TOKEN_FAILED",
+        result.error.message);
+    }
+    const token = String(result && result.token || "").trim();
+    if (!/^ctoken_[A-Za-z0-9]+$/.test(token)) {
+      throw new AppError(502, "CHECKOUT_CONFIRMATION_TOKEN_INVALID", "Stripe.js did not return a valid ConfirmationToken.");
+    }
+    return Object.freeze({
+      token,
+      selectedPaymentMethodType: "card",
+      selectedPaymentMethodId: String(result.selectedPaymentMethodId || "")
+    });
   }
 
   async observeCheckoutPaymentError(timeoutMs = 60_000) {
@@ -626,6 +1173,81 @@ class CheckoutProtocolRuntime {
     return Object.freeze({ status: status || "submitted" });
   }
 
+  async confirmBangKaStripeIntent({
+    type,
+    clientSecret,
+    confirmationToken,
+    publishableKey,
+    checkoutSessionId,
+    processorEntity,
+    planType = "plus"
+  } = {}) {
+    if (!this.context || !this.context.request) {
+      throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
+    }
+    const normalizedType = String(type || "").trim().toLowerCase();
+    const secret = String(clientSecret || "").trim();
+    const token = String(confirmationToken || "").trim();
+    const key = String(publishableKey || "").trim();
+    const secretKind = secret.startsWith("seti_") ? "setup_intent" : secret.startsWith("pi_") ? "payment_intent" : "";
+    const intentType = ["setup_intent", "payment_intent"].includes(normalizedType) ? normalizedType : secretKind;
+    const intentId = secret.split("_secret_", 1)[0];
+    if (!intentType || !/^(?:seti|pi)_[A-Za-z0-9_-]+$/.test(intentId)
+        || !/^(?:seti|pi)_[A-Za-z0-9_-]+_secret_[A-Za-z0-9_-]+$/.test(secret)
+        || !/^ctoken_[A-Za-z0-9]+$/.test(token)
+        || !/^pk_(?:live|test)_[A-Za-z0-9]+$/.test(key)) {
+      throw new AppError(502, "CHECKOUT_STRIPE_CONFIRM_INPUT_INVALID", "Stripe intent confirmation input is invalid.");
+    }
+    const intentKind = intentType === "setup_intent" ? "setup_intents" : "payment_intents";
+    const returnUrl = `${CHATGPT_ORIGIN}/checkout/verify?${new URLSearchParams({
+      stripe_session_id: String(checkoutSessionId || ""),
+      processor_entity: String(processorEntity || ""),
+      plan_type: String(planType || "plus")
+    })}`;
+    let response;
+    try {
+      response = await this.context.request.post(`https://api.stripe.com/v1/${intentKind}/${intentId}/confirm`, {
+        headers: {
+          Accept: "application/json",
+          "Accept-Language": "en-US,en;q=0.9",
+          Origin: "https://js.stripe.com",
+          Priority: "u=1, i",
+          Referer: "https://js.stripe.com/",
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        form: {
+          client_secret: secret,
+          return_url: returnUrl,
+          key,
+          _stripe_version: "2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1",
+          confirmation_token: token
+        },
+        timeout: Math.min(this.timeoutMs, 60_000)
+      });
+    } catch (error) {
+      throw new AppError(502, "CHECKOUT_STRIPE_CONFIRM_FAILED", `Stripe intent confirmation failed: ${String(error && error.message || error).slice(0, 220)}`);
+    }
+    const text = await response.text();
+    let payload = {};
+    try { payload = text ? JSON.parse(text) : {}; } catch {}
+    if (!response.ok()) {
+      const provider = payload && payload.error || {};
+      const message = String(provider.message || `Stripe returned HTTP ${response.status()}`).slice(0, 240);
+      const actionRequired = /auth|captcha|challenge|action|required/i.test(`${provider.code || ""} ${provider.type || ""} ${message}`);
+      throw new AppError(actionRequired ? 409 : 502,
+        actionRequired ? "TRIAL_SUBSCRIPTION_ACTION_REQUIRED" : "CHECKOUT_STRIPE_CONFIRM_FAILED",
+        message);
+    }
+    const status = String(payload && payload.status || "").trim().toLowerCase();
+    if (["requires_action", "requires_confirmation", "requires_payment_method"].includes(status)) {
+      throw new AppError(409, "TRIAL_SUBSCRIPTION_ACTION_REQUIRED", `Stripe returned ${status}.`);
+    }
+    if (status && !["succeeded", "processing", "requires_capture"].includes(status)) {
+      throw new AppError(502, "CHECKOUT_STRIPE_STATUS_INVALID", `Stripe returned ${status}.`);
+    }
+    return Object.freeze({ status: status || "submitted", transport: "stripe_form_protocol" });
+  }
+
   async handleStripeNextAction(clientSecret) {
     if (!this.page) throw new AppError(500, "CHECKOUT_RUNTIME_NOT_OPEN", "Checkout runtime has not been opened.");
     const result = await this.page.evaluate(async (input) => {
@@ -663,6 +1285,7 @@ class CheckoutProtocolRuntime {
     const expected = String(expectedRegion || "").toUpperCase();
     let lastError;
     let lastTrace = {};
+    let lastTraceStatus = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         await this.ensureChatGptPage();
@@ -680,6 +1303,7 @@ class CheckoutProtocolRuntime {
             clearTimeout(timer);
           }
         }, { attempt, timeoutMs: this.timeoutMs });
+        lastTraceStatus = Number(traceResult.status);
         lastTrace = parseTrace(traceResult.text);
         if (traceResult.status === 200 && lastTrace.loc === expected) {
           return Object.freeze({ region: lastTrace.loc, colo: lastTrace.colo || "" });
@@ -697,11 +1321,41 @@ class CheckoutProtocolRuntime {
     if (lastTrace.loc && lastTrace.loc !== expected) {
       throw new AppError(502, "CHECKOUT_PROXY_REGION_MISMATCH", `${expected} checkout phase returned ${lastTrace.loc}.`);
     }
+    const tunnelFailure = this.relay && typeof this.relay.getLastTunnelFailure === "function"
+      ? this.relay.getLastTunnelFailure()
+      : null;
+    if (tunnelFailure) {
+      const upstreamStatus = Number(tunnelFailure.upstreamStatus) || null;
+      const authenticationRejected = upstreamStatus === 407;
+      throw new AppError(
+        502,
+        authenticationRejected ? "CHECKOUT_PROXY_AUTH_FAILED" : "CHECKOUT_PROXY_TUNNEL_FAILED",
+        authenticationRejected
+          ? `${expected} proxy gateway rejected the HTTPS tunnel with HTTP 407 (proxy authentication required).`
+          : `${expected} proxy tunnel failed (${tunnelFailure.code || "PROXY_TUNNEL_FAILED"}).`,
+        Object.freeze({
+          expectedRegion: expected,
+          tunnelCode: tunnelFailure.code || null,
+          upstreamStatus
+        })
+      );
+    }
+    const traceStatus = Number.isFinite(lastTraceStatus) ? lastTraceStatus : null;
+    const causeCode = String(lastError && (lastError.code || lastError.name) || "").slice(0, 80);
+    const diagnostic = traceStatus == null
+      ? `no trace response${causeCode ? `, cause=${causeCode}` : ""}`
+      : `trace HTTP ${traceStatus}${lastTrace.loc ? `, loc=${lastTrace.loc}` : ", loc=missing"}`;
     throw new AppError(
       502,
       "CHECKOUT_PROXY_TRACE_FAILED",
-      `${expected} checkout phase could not verify its proxy exit.`,
-      lastError
+      `${expected} checkout phase could not verify its proxy exit (${diagnostic}; attempts=3).`,
+      Object.freeze({
+        expectedRegion: expected,
+        attempts: 3,
+        traceStatus,
+        traceRegion: lastTrace.loc || null,
+        causeCode: causeCode || null
+      })
     );
   }
 
@@ -733,7 +1387,11 @@ class CheckoutProtocolRuntime {
       href: target.href,
       method: options.method || "GET",
       timeoutMs: Number(options.timeoutMs) || this.timeoutMs,
-      headers: options.headers || { Accept: "application/json" },
+      headers: {
+        "oai-device-id": this.deviceId,
+        "oai-language": "en-US",
+        ...(options.headers || { Accept: "application/json" })
+      },
       hasBody: Object.hasOwn(options, "body"),
       body: options.body
     };
@@ -795,6 +1453,15 @@ class CheckoutProtocolRuntime {
   }
 
   async readSession() {
+    if (this.importedAuthSession) {
+      const session = this.importedAuthSession;
+      const accessToken = String(session.accessToken || "").trim();
+      const expiresMs = Date.parse(String(session.expires || ""));
+      if (!accessToken || (Number.isFinite(expiresMs) && expiresMs <= Date.now())) {
+        throw new AppError(401, "CHECKOUT_SESSION_EXPIRED", "The imported access token has expired.");
+      }
+      return Object.freeze({ session, accessToken });
+    }
     const session = await this.requestJson(`${SESSION_ENDPOINT}?_=${Date.now()}`, {
       headers: { Accept: "application/json", "Cache-Control": "no-store" },
       stage: "Session check"
@@ -873,6 +1540,7 @@ class CheckoutProtocolRuntime {
     this.browser = null;
     this.relay = null;
     this.stripeBridgeInstalled = false;
+    this.importedAuthSession = null;
   }
 }
 
@@ -880,18 +1548,247 @@ class ChatGptCheckoutLinkClient {
   constructor(options = {}) {
     this.runtimeFactory = options.runtimeFactory || (() => new CheckoutProtocolRuntime(options));
     this.proxySessionId = options.proxySessionId || "";
+    this.sleep = options.sleep || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    const loadWaitMs = Number(options.checkoutLoadWaitMs);
+    const verificationDelayMs = Number(options.checkoutVerificationDelayMs);
+    const verificationAttempts = Number(options.checkoutVerificationAttempts);
+    this.checkoutLoadWaitMs = Number.isFinite(loadWaitMs) ? Math.max(0, loadWaitMs) : 30_000;
+    this.checkoutVerificationDelayMs = Number.isFinite(verificationDelayMs)
+      ? Math.max(0, verificationDelayMs)
+      : 20_000;
+    this.checkoutVerificationAttempts = Number.isInteger(verificationAttempts)
+      ? Math.max(1, Math.min(verificationAttempts, 5))
+      : 3;
   }
 
-  async extract({ accountSession, proxies, reportProgress = async () => {} } = {}) {
+  async extract({ accountSession, proxies, proxySessionId = "", reportProgress = async () => {} } = {}) {
     const session = normalizeAccountSession(accountSession);
     const selected = normalizeCheckoutProxies(proxies);
-    const sessionId = this.proxySessionId || crypto.randomBytes(4).toString("hex");
+    const flowSessionId = String(proxySessionId || this.proxySessionId || crypto.randomBytes(4).toString("hex")).trim();
+    if (!/^[a-z0-9]{8}$/i.test(flowSessionId)) {
+      throw new AppError(400, "INVALID_PROXY_SESSION_ID", "Checkout flow session id must contain eight letters or digits.");
+    }
+    const sticky = Object.freeze({
+      US: createStickyProxySession(selected.US, { sessionId: flowSessionId }),
+      TR: createStickyProxySession(selected.TR, { sessionId: flowSessionId })
+    });
+    const runtime = this.runtimeFactory();
+    try {
+      await reportProgress("正在通过 US 代理创建 PH/PHP 优惠 Checkout");
+      await runtime.open({ accountSession: session, proxy: sticky.US });
+      await runtime.verifyExit("US");
+      const usSession = await runtime.readSession();
+      const accountId = core.getSessionAccountId(usSession.session);
+      const created = await runtime.requestJson(CHECKOUT_ENDPOINT, {
+        method: "POST",
+        headers: accountCheckoutHeaders(usSession.accessToken, accountId, CHECKOUT_ENDPOINT, {
+          "Content-Type": "application/json"
+        }),
+        body: buildCheckoutCreateBody(),
+        stage: "US PH/PHP checkout creation"
+      });
+      let checkoutSessionId = extractBangKaCheckoutSessionId(created);
+      let processorEntity = extractBangKaProcessorEntity(created, BANGKA_CHECKOUT_CONFIG.country);
+      if (!checkoutSessionId) {
+        throw new AppError(502, "CHECKOUT_SESSION_ID_MISSING", "Checkout creation succeeded without a checkout session id.");
+      }
+      await reportProgress("US Checkout 已创建，正在通过 TR 代理更新同一会话的首月优惠", {
+        protocolMode: "bangka_oaics",
+        checkoutCountry: BANGKA_CHECKOUT_CONFIG.country,
+        currency: BANGKA_CHECKOUT_CONFIG.currency
+      });
+
+      await runtime.switchProxy("TR", sticky.TR);
+      await runtime.verifyExit("TR");
+      const trSession = await runtime.readSession();
+      const trAccountId = core.getSessionAccountId(trSession.session) || accountId;
+      const provisionalUrl = `${CHATGPT_ORIGIN}/checkout/${processorEntity}/${checkoutSessionId}`;
+      const updated = await runtime.requestJson(CHECKOUT_UPDATE_ENDPOINT, {
+        method: "POST",
+        headers: accountCheckoutHeaders(trSession.accessToken, trAccountId, CHECKOUT_UPDATE_ENDPOINT, {
+          "Content-Type": "application/json",
+          Referer: provisionalUrl
+        }),
+        body: buildCheckoutUpdateBody({ checkoutSessionId, processorEntity }),
+        stage: "TR same-session promotion update"
+      });
+      checkoutSessionId = extractBangKaCheckoutSessionId(updated) || checkoutSessionId;
+      processorEntity = extractBangKaProcessorEntity(updated, BANGKA_CHECKOUT_CONFIG.country) || processorEntity;
+      if (!/^oaics_[A-Za-z0-9_-]+$/.test(checkoutSessionId)) {
+        throw new AppError(409, "CHECKOUT_OAICS_REQUIRED", "Checkout promotion update did not return an oaics_ session.");
+      }
+      const amount = extractBangKaCheckoutAmount(updated);
+      if (amount.source && amount.amount !== 0) {
+        throw new AppError(409, "CHECKOUT_NONZERO_AMOUNT", `Checkout promotion update returned a non-zero amount (${amount.amount}).`);
+      }
+      const checkoutUrl = `${CHATGPT_ORIGIN}/checkout/${processorEntity}/${checkoutSessionId}`;
+      await runtime.requestJson(checkoutUrl, {
+        headers: { Accept: "text/html,application/xhtml+xml", Referer: `${CHATGPT_ORIGIN}/` },
+        stage: "TR checkout link verification"
+      });
+      const stripePublishableKey = extractStripePublishableKey(updated) || extractStripePublishableKey(created);
+      if (!/^pk_(?:live|test)_[A-Za-z0-9]+$/.test(stripePublishableKey)) {
+        throw new AppError(502, "CHECKOUT_STRIPE_KEY_MISSING", "Checkout response did not include a Stripe publishable key.");
+      }
+      await runtime.saveSession(session.path);
+      const zeroAmountVerified = Boolean(amount.source) && amount.amount === 0;
+      await reportProgress(zeroAmountVerified
+        ? "US → TR 提链完成；oaics_ 链接与返回金额 0 已验证"
+        : "US → TR 提链完成；oaics_ 链接已验证，金额将在 Taxes 阶段复核", {
+        protocolMode: "bangka_oaics",
+        amountSource: amount.source || "unknown",
+        zeroAmountVerified
+      });
+      return Object.freeze({
+        checkoutUrl,
+        checkoutSessionId,
+        processorEntity,
+        stripePublishableKey,
+        campaignId: BANGKA_CHECKOUT_CONFIG.campaignId,
+        promotionApplied: zeroAmountVerified,
+        fullDiscountVerified: zeroAmountVerified,
+        zeroAmountVerified,
+        discountPercent: zeroAmountVerified ? 100 : null,
+        subtotalMinorUnits: null,
+        discountMinorUnits: null,
+        dueTodayMinorUnits: amount.source ? amount.amount : null,
+        amountSource: amount.source,
+        promotionStatus: zeroAmountVerified ? "zero_due" : "pending_zero_amount_verification",
+        promotionVerification: amount.source ? "bangka_checkout_update" : "bangka_taxes_pending",
+        protocolMode: "bangka_oaics",
+        sessionKind: "oaics",
+        route: "chatgpt_internal",
+        checkoutCountry: BANGKA_CHECKOUT_CONFIG.country,
+        currency: BANGKA_CHECKOUT_CONFIG.currency,
+        proxyFlow: Object.freeze(["US", "TR"]),
+        extractedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw new AppError(502, "CHECKOUT_EXTRACTION_FAILED", error && error.message || "Checkout extraction failed.");
+    } finally {
+      await runtime.close().catch(() => {});
+    }
+  }
+
+  async waitForCheckout(runtime, milliseconds) {
+    if (milliseconds <= 0) return;
+    if (runtime && typeof runtime.waitForRetry === "function") {
+      await runtime.waitForRetry(milliseconds);
+      return;
+    }
+    await this.sleep(milliseconds);
+  }
+
+  async verifyPromotionUnderUs({
+    runtime,
+    checkout,
+    authenticated,
+    accountId,
+    reportProgress
+  }) {
+    const sessionId = extractAnyCheckoutSessionId(checkout);
+    if (!sessionId) {
+      return Object.freeze({
+        checkout,
+        navigable: resolveNavigableCheckout(checkout),
+        promotionApplied: core.hasAppliedPromotion(checkout),
+        detailVerified: false
+      });
+    }
+    const processorEntity = checkoutProcessorEntity(checkout);
+    const internalCheckout = resolveInternalCheckout({
+      ...checkout,
+      checkout_session_id: sessionId,
+      processor_entity: processorEntity
+    });
+    if (!internalCheckout) {
+      return Object.freeze({
+        checkout,
+        navigable: resolveNavigableCheckout(checkout),
+        promotionApplied: core.hasAppliedPromotion(checkout),
+        detailVerified: false
+      });
+    }
+    if (typeof runtime.navigateCheckout !== "function" && core.hasFullDiscountPromotion(checkout)) {
+      return Object.freeze({
+        checkout,
+        navigable: internalCheckout,
+        promotionApplied: true,
+        detailVerified: false
+      });
+    }
+
+    let current = checkout;
+    let detailVerified = false;
+    if (typeof runtime.navigateCheckout === "function") {
+      await reportProgress("正在通过 US 打开同一个 Checkout，等待优惠和金额充分加载");
+      try {
+        await runtime.navigateCheckout(internalCheckout.checkoutUrl);
+        await this.waitForCheckout(runtime, this.checkoutLoadWaitMs);
+      } catch (error) {
+        if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
+        await reportProgress("Checkout 页面尚未完全加载，继续使用同一会话读取优惠状态");
+      }
+    }
+
+    const route = `/backend-api/payments/checkout/${encodeURIComponent(processorEntity)}/${encodeURIComponent(sessionId)}`;
+    for (let attempt = 0; attempt < this.checkoutVerificationAttempts; attempt += 1) {
+      try {
+        const detail = await runtime.requestJson(route, {
+          headers: accountCheckoutHeaders(authenticated.accessToken, accountId, route),
+          stage: "US checkout promotion verification"
+        });
+        const merged = mergeSameSessionCheckout(current, detail, sessionId);
+        if (merged) current = merged;
+        detailVerified = true;
+        await reportProgress(`US Checkout 优惠与金额校验 ${attempt + 1}/${this.checkoutVerificationAttempts} 已返回`, {
+          promotionApplied: core.hasAppliedPromotion(current),
+          fullDiscountVerified: core.hasFullDiscountPromotion(current),
+          shape: core.describeCheckoutResponseShape(detail),
+          promotion: core.summarizePromotionState(detail)
+        });
+        if (core.hasFullDiscountPromotion(current)) break;
+      } catch (error) {
+        if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
+      }
+      if (attempt >= this.checkoutVerificationAttempts - 1) break;
+      await reportProgress(`Checkout 尚未显示优惠，${Math.round(this.checkoutVerificationDelayMs / 1000)} 秒后仅刷新当前提链页（${attempt + 1}/${this.checkoutVerificationAttempts - 1}）`);
+      await this.waitForCheckout(runtime, this.checkoutVerificationDelayMs);
+      try {
+        if (typeof runtime.refreshCheckout === "function") {
+          await runtime.refreshCheckout(internalCheckout.checkoutUrl);
+        } else if (typeof runtime.refreshCurrentPage === "function") {
+          await runtime.refreshCurrentPage();
+        }
+      } catch {}
+    }
+
+    return Object.freeze({
+      checkout: current,
+      navigable: resolveInternalCheckout(current) || internalCheckout,
+      promotionApplied: core.hasAppliedPromotion(current),
+      detailVerified
+    });
+  }
+
+  async extractLegacy({ accountSession, proxies, proxySessionId = "", checkoutSeed = null, reportProgress = async () => {} } = {}) {
+    const session = normalizeAccountSession(accountSession);
+    const selected = normalizeCheckoutProxies(proxies);
+    const sessionId = String(proxySessionId || this.proxySessionId || crypto.randomBytes(4).toString("hex")).trim();
+    if (!/^[a-z0-9]{8}$/i.test(sessionId)) {
+      throw new AppError(400, "INVALID_PROXY_SESSION_ID", "Checkout flow session id must contain eight letters or digits.");
+    }
     const sticky = Object.freeze({
       US: createStickyProxySession(selected.US, { sessionId }),
       TR: createStickyProxySession(selected.TR, { sessionId })
     });
     const runtime = this.runtimeFactory();
-    let baselineCheckout = null;
+    let baselineCheckout = checkoutSeed && typeof checkoutSeed === "object"
+      && extractAnyCheckoutSessionId(checkoutSeed)
+      ? checkoutSeed
+      : null;
+    const reusedCheckoutSeed = Boolean(baselineCheckout);
     try {
       await reportProgress("正在通过 US 代理恢复已保存的 ChatGPT 会话");
       await runtime.open({ accountSession: session, proxy: sticky.US });
@@ -899,19 +1796,37 @@ class ChatGptCheckoutLinkClient {
       const usSession = await runtime.readSession();
       await reportProgress("US 出口和登录会话实时校验通过");
 
+      if (typeof runtime.installCheckoutStripeBridge === "function") {
+        await runtime.installCheckoutStripeBridge();
+      }
+
       if (typeof runtime.prepareSentinelSdk === "function") {
         const prepared = await runtime.prepareSentinelSdk().catch(() => false);
         if (prepared) await reportProgress("结账校验 SDK 已在 US 会话预载");
       }
 
-      baselineCheckout = await runtime.requestJson(CHECKOUT_ENDPOINT, {
-        method: "POST",
-        headers: authHeaders(usSession.accessToken, { "Content-Type": "application/json" }),
-        body: core.buildBaselineCheckoutPayload(),
-        stage: "US baseline checkout"
-      });
+      if (baselineCheckout) {
+        await reportProgress("正在复用绑卡临时账单的原始 Checkout 身份", {
+          flow: "isolated_card_flow",
+          sessionKind: extractAnyCheckoutSessionId(baselineCheckout).startsWith("oaics_") ? "oaics" : "standard"
+        });
+      } else {
+        baselineCheckout = await runtime.requestJson(CHECKOUT_ENDPOINT, {
+          method: "POST",
+          headers: accountCheckoutHeaders(
+            usSession.accessToken,
+            core.getSessionAccountId(usSession.session),
+            CHECKOUT_ENDPOINT,
+            { "Content-Type": "application/json" }
+          ),
+          body: core.buildBaselineCheckoutPayload(),
+          stage: "US baseline checkout"
+        });
+      }
       let fallbackNavigable = resolveNavigableCheckout(baselineCheckout);
-      await reportProgress("US 基线 Checkout 已创建，正在切换到 TR 代理");
+      await reportProgress(reusedCheckoutSeed
+        ? "原始 Checkout 身份已恢复，正在执行 US/TR 代理预检"
+        : "US 基线 Checkout 已创建，正在切换到 TR 代理");
 
       await runtime.switchProxy("TR", sticky.TR);
       await runtime.verifyExit("TR");
@@ -948,149 +1863,287 @@ class ChatGptCheckoutLinkClient {
       }
 
       const campaignId = core.selectPlusPromotionCampaign(accountContext);
+      const accountId = accountContext.accountId || core.getSessionAccountId(trSession.session);
+      let couponEligibility = Object.freeze({ known: false, eligible: false, status: "unavailable" });
+      const couponQuery = new URLSearchParams({
+        coupon: campaignId,
+        is_coupon_from_query_param: "false"
+      });
+      for (const endpoint of PROMOTION_COUPON_ENDPOINTS) {
+        const route = `${endpoint}?${couponQuery}`;
+        try {
+          const couponPayload = await runtime.requestJson(route, {
+            headers: accountCheckoutHeaders(trSession.accessToken, accountId, endpoint),
+            stage: "Promotion coupon eligibility"
+          });
+          couponEligibility = summarizeCouponEligibility(couponPayload);
+          break;
+        } catch (error) {
+          if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
+          if (Number(error && error.status) !== 404) break;
+        }
+      }
+      const accountCampaignEligible = accountContext.eligibleCampaignIds.includes(campaignId);
+      const officialPromotionEligible = accountCampaignEligible || couponEligibility.eligible;
+      const promotionPathEligible = officialPromotionEligible
+        || paymentPreflight.oneClickTrialEligible;
       await reportProgress("已解析账户活动上下文", {
         campaignId,
         account: core.summarizeAccountPromotionContext(accountContext),
-        oneClickTrialEligible: paymentPreflight.oneClickTrialEligible
+        oneClickTrialEligible: paymentPreflight.oneClickTrialEligible,
+        couponEligibilityStatus: couponEligibility.status,
+        couponEligible: couponEligibility.eligible,
+        officialPromotionEligible,
+        promotionPathEligible
       });
-      const baselineOaics = core.extractOpenAICheckoutSessionId(baselineCheckout);
+      const baselineSessionId = extractAnyCheckoutSessionId(baselineCheckout);
       let checkout = null;
-      let oaicsSessionId = "";
-      let fallbackCheckout = baselineOaics
-        ? { ...baselineCheckout, checkout_session_id: baselineOaics, processor_entity: "openai_llc" }
-        : null;
-      let fallbackOaics = baselineOaics;
+      let preferredCheckout = baselineCheckout;
+      let preferredNavigable = fallbackNavigable;
+      let promotionVerification = "unverified";
+      let authoritativeDiscount = null;
 
-      if (baselineOaics) {
-        await reportProgress("正在通过 TR 将活动应用到 US 阶段创建的同一 OAICS Checkout");
+      if (officialPromotionEligible && !reusedCheckoutSeed
+          && typeof runtime.createPromotedCheckoutFromPricing === "function") {
+        await reportProgress("正在通过 TR 官方定价页核验免费 Plus 报价并创建 Checkout");
+        const officialPromotion = await runtime.createPromotedCheckoutFromPricing({ campaignId });
+        checkout = officialPromotion.checkout;
+        preferredCheckout = officialPromotion.checkout;
+        authoritativeDiscount = officialPromotion.fullDiscount;
+        promotionVerification = "tr_official_pricing_ui";
+        const officialResolved = resolveInternalCheckout(officialPromotion.checkout)
+          || resolveNavigableCheckout(officialPromotion.checkout);
+        preferredNavigable = Object.freeze({
+          ...(officialResolved || {}),
+          payload: officialPromotion.checkout,
+          checkoutUrl: officialPromotion.checkoutUrl,
+          route: officialResolved && officialResolved.route || "chatgpt_internal",
+          oaicsSessionId: officialResolved && officialResolved.oaicsSessionId || "",
+          sessionKind: officialResolved && officialResolved.sessionKind || "standard"
+        });
+        await reportProgress("TR 官方定价页已确认首月 100% 优惠与本次应付 0，并返回 Checkout", {
+          promotionApplied: true,
+          fullDiscountVerified: true,
+          discountPercent: authoritativeDiscount.discountPercent,
+          dueTodayMinorUnits: authoritativeDiscount.dueTodayMinorUnits,
+          shape: core.describeCheckoutResponseShape(officialPromotion.checkout),
+          promotion: core.summarizePromotionState(officialPromotion.checkout)
+        });
+      }
+
+      if (!checkout && baselineSessionId) {
+        await reportProgress("正在通过 TR 将活动更新到 US 阶段创建的同一个 Checkout");
         try {
           const updated = await runtime.requestJson(CHECKOUT_UPDATE_ENDPOINT, {
             method: "POST",
-            headers: authHeaders(trSession.accessToken, { "Content-Type": "application/json" }),
+            headers: accountCheckoutHeaders(trSession.accessToken, accountId, CHECKOUT_UPDATE_ENDPOINT, {
+              "Content-Type": "application/json"
+            }),
             body: core.buildPromotionUpdatePayload({
-              checkoutSessionId: baselineOaics,
-              processorEntity: "openai_llc",
+              checkoutSessionId: baselineSessionId,
+              processorEntity: checkoutProcessorEntity(baselineCheckout),
               campaignId
             }),
-            stage: "TR checkout promotion update"
+            stage: "TR same-session checkout promotion update"
           });
-          const updatedOaics = core.extractOpenAICheckoutSessionId(updated) || baselineOaics;
-          const updateApplied = core.hasAppliedPromotion(updated);
-          if (updatedOaics) {
-            fallbackCheckout = { ...updated, checkout_session_id: updatedOaics, processor_entity: "openai_llc" };
-            fallbackOaics = updatedOaics;
-          }
+          const merged = mergeSameSessionCheckout(baselineCheckout, updated, baselineSessionId);
+          const updateApplied = Boolean(merged && core.hasAppliedPromotion(merged));
+          if (merged) preferredCheckout = merged;
           await reportProgress("TR 同会话活动更新已返回", {
+            sameSession: Boolean(merged),
             promotionApplied: updateApplied,
             shape: core.describeCheckoutResponseShape(updated),
             identifiers: core.describeCheckoutIdentifiers(updated),
             promotion: core.summarizePromotionState(updated)
           });
-          if (updatedOaics && updateApplied) {
-            checkout = { ...updated, checkout_session_id: updatedOaics, processor_entity: "openai_llc" };
-            oaicsSessionId = updatedOaics;
+          if (updateApplied) {
+            checkout = merged;
+            promotionVerification = "same_session_update";
           }
         } catch (error) {
           if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
+          await reportProgress("TR 同会话活动更新暂未完成，保留 US Checkout 并回到 US 继续验证");
         }
       }
 
-      if (!checkout) {
-        await reportProgress("同会话更新尚未确认活动，正在生成 Sentinel 结账校验头");
+      await reportProgress("正在切回 US，确保提链、账单和最终验证保持同一国家");
+      await runtime.switchProxy("US", sticky.US);
+      await runtime.verifyExit("US");
+      const finalUsSession = await runtime.readSession();
+      await reportProgress("US 最终校验出口和登录会话已确认");
+
+      const liveResolved = preferredNavigable || resolveInternalCheckout(preferredCheckout)
+        || resolveNavigableCheckout(preferredCheckout);
+      if (liveResolved && liveResolved.sessionKind === "standard"
+          && typeof runtime.waitForCheckoutCustomSession === "function") {
+        await reportProgress("正在从 Stripe Custom Checkout 读取实时折扣与本次应付金额");
+        if (typeof runtime.refreshCheckout === "function") {
+          await runtime.refreshCheckout(liveResolved.checkoutUrl);
+        } else if (typeof runtime.navigateCheckout === "function") {
+          await runtime.navigateCheckout(liveResolved.checkoutUrl);
+        }
+        const liveFinancials = await runtime.waitForCheckoutCustomSession(this.checkoutLoadWaitMs);
+        const subtotalMinorUnits = liveFinancials.subtotalMinorUnits == null
+          ? (liveFinancials.dueTodayMinorUnits == null
+            ? null
+            : liveFinancials.dueTodayMinorUnits + liveFinancials.discountMinorUnits)
+          : liveFinancials.subtotalMinorUnits;
+        const zeroAmountVerified = liveFinancials.dueTodayMinorUnits === 0;
+        authoritativeDiscount = Object.freeze({
+          fullDiscountVerified: zeroAmountVerified,
+          zeroAmountVerified,
+          discountPercent: liveFinancials.discountPercent,
+          subtotalMinorUnits,
+          discountMinorUnits: liveFinancials.discountMinorUnits,
+          dueTodayMinorUnits: liveFinancials.dueTodayMinorUnits
+        });
+        promotionVerification = "stripe_custom_checkout";
+        await reportProgress("Stripe Custom Checkout 实时金额已返回", {
+          fullDiscountVerified: authoritativeDiscount.fullDiscountVerified,
+          discountPercent: authoritativeDiscount.discountPercent,
+          subtotalMinorUnits: authoritativeDiscount.subtotalMinorUnits,
+          discountMinorUnits: authoritativeDiscount.discountMinorUnits,
+          dueTodayMinorUnits: authoritativeDiscount.dueTodayMinorUnits
+        });
+      }
+
+      if (promotionPathEligible && !authoritativeDiscount) {
+        const verifiedBaseline = await this.verifyPromotionUnderUs({
+          runtime,
+          checkout: preferredCheckout,
+          authenticated: finalUsSession,
+          accountId,
+          reportProgress
+        });
+        preferredCheckout = verifiedBaseline.checkout;
+        preferredNavigable = verifiedBaseline.navigable || preferredNavigable;
+        if (verifiedBaseline.promotionApplied) {
+          checkout = verifiedBaseline.checkout;
+          promotionVerification = verifiedBaseline.detailVerified
+            ? "us_checkout_detail"
+            : promotionVerification;
+        }
+      }
+
+      if (!checkout && promotionPathEligible) {
+        await reportProgress("同会话优惠尚未确认，正在 US 下生成带活动参数的 Checkout");
         let sentinelHeaders = null;
-        let sentinelError = null;
         for (let sentinelAttempt = 0; sentinelAttempt < 3; sentinelAttempt += 1) {
           try {
             sentinelHeaders = await runtime.acquireSentinelHeaders();
             break;
           } catch (error) {
-            sentinelError = error;
             if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
             if (sentinelAttempt >= 2 || typeof runtime.refreshCurrentPage !== "function") break;
             await reportProgress(`Sentinel 尚未加载，20 秒后仅刷新当前提链页并重试（${sentinelAttempt + 1}/2）`);
-            if (typeof runtime.waitForRetry === "function") await runtime.waitForRetry(20_000);
-            else await new Promise((resolve) => setTimeout(resolve, 20_000));
+            await this.waitForCheckout(runtime, 20_000);
             await runtime.refreshCurrentPage();
           }
         }
-        if (!sentinelHeaders) {
-          throw sentinelError || new AppError(502, "CHECKOUT_SENTINEL_INVALID", "Sentinel headers are unavailable.");
-        }
-        const attempts = [
-          core.buildShortPromotionPayload({ campaignId }),
-          core.buildPromotionCheckoutPayload({ campaignId, oneClickTrial: false })
-        ];
-        for (const [attemptIndex, body] of attempts.entries()) {
-          let candidate;
-          try {
-            candidate = await runtime.requestJson(CHECKOUT_ENDPOINT, {
-              method: "POST",
-              headers: authHeaders(trSession.accessToken, {
-                ...sentinelHeaders,
-                "Content-Type": "application/json"
-              }),
-              body,
-              stage: "TR promoted checkout"
+
+        if (sentinelHeaders) {
+          const attempts = [
+            core.buildShortPromotionPayload({ campaignId, country: "US", currency: "USD" }),
+            core.buildPromotionCheckoutPayload({
+              campaignId,
+              oneClickTrial: paymentPreflight.oneClickTrialEligible,
+              country: "US",
+              currency: "USD"
+            })
+          ];
+          for (const [attemptIndex, body] of attempts.entries()) {
+            let candidate;
+            try {
+              candidate = await runtime.requestJson(CHECKOUT_ENDPOINT, {
+                method: "POST",
+                headers: accountCheckoutHeaders(finalUsSession.accessToken, accountId, CHECKOUT_ENDPOINT, {
+                  ...sentinelHeaders,
+                  "Content-Type": "application/json"
+                }),
+                body,
+                stage: "US promoted checkout"
+              });
+            } catch (error) {
+              if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
+              continue;
+            }
+            const navigableCandidate = resolveNavigableCheckout(candidate);
+            if (!navigableCandidate) continue;
+            preferredCheckout = candidate;
+            preferredNavigable = resolveInternalCheckout(candidate) || navigableCandidate;
+            const verifiedCandidate = await this.verifyPromotionUnderUs({
+              runtime,
+              checkout: candidate,
+              authenticated: finalUsSession,
+              accountId,
+              reportProgress
             });
-          } catch (error) {
-            if (error && error.code === "CHECKOUT_SESSION_EXPIRED") throw error;
-            continue;
+            preferredCheckout = verifiedCandidate.checkout;
+            preferredNavigable = verifiedCandidate.navigable || preferredNavigable;
+            await reportProgress(`US 活动 Checkout 尝试 ${attemptIndex + 1} 已完成`, {
+              promotionApplied: verifiedCandidate.promotionApplied,
+              checkoutCountry: "US",
+              shape: core.describeCheckoutResponseShape(candidate),
+              identifiers: core.describeCheckoutIdentifiers(candidate),
+              promotion: core.summarizePromotionState(verifiedCandidate.checkout)
+            });
+            if (verifiedCandidate.promotionApplied) {
+              checkout = verifiedCandidate.checkout;
+              promotionVerification = verifiedCandidate.detailVerified
+                ? "us_checkout_detail"
+                : "us_checkout_response";
+              break;
+            }
           }
-          const candidateOaics = core.extractOpenAICheckoutSessionId(candidate);
-          const candidateApplied = core.hasAppliedPromotion(candidate);
-          const navigableCandidate = resolveNavigableCheckout(candidate);
-          if (!fallbackNavigable && navigableCandidate) fallbackNavigable = navigableCandidate;
-          if (candidateOaics) {
-            fallbackCheckout = { ...candidate, checkout_session_id: candidateOaics, processor_entity: "openai_llc" };
-            fallbackOaics = candidateOaics;
-          }
-          await reportProgress(`TR 活动 Checkout 尝试 ${attemptIndex + 1} 已返回`, {
-            promotionApplied: candidateApplied,
-            shape: core.describeCheckoutResponseShape(candidate),
-            identifiers: core.describeCheckoutIdentifiers(candidate),
-            promotion: core.summarizePromotionState(candidate)
-          });
-          if (candidateOaics && candidateApplied) {
-            checkout = { ...candidate, checkout_session_id: candidateOaics, processor_entity: "openai_llc" };
-            oaicsSessionId = candidateOaics;
-            break;
-          }
+        } else {
+          await reportProgress("Sentinel 暂未就绪，已保留同一个 US Checkout，等待后续复检");
         }
       }
 
-      if (!checkout && fallbackCheckout && fallbackOaics) {
-        checkout = fallbackCheckout;
-        oaicsSessionId = fallbackOaics;
-        await reportProgress("当前账号未检测到活动资格，已保留可导航的 OAICS 结账链接");
-      }
-      let resolved = checkout ? resolveNavigableCheckout(checkout) : fallbackNavigable;
+      if (!checkout) checkout = preferredCheckout;
+      let resolved = preferredNavigable || resolveInternalCheckout(checkout) || resolveNavigableCheckout(checkout);
       if (!resolved) throw new AppError(502, "CHECKOUT_URL_MISSING", "Checkout response did not include a navigable URL.");
-      if (!checkout) {
-        checkout = resolved.payload;
-        oaicsSessionId = resolved.oaicsSessionId;
-        await reportProgress("优惠尚未挂载，已保留普通结账链接供绑卡；绑卡后将重新校验活动资格");
+      const fullDiscount = authoritativeDiscount || core.summarizeFullDiscountPromotion(checkout);
+      const zeroAmountVerified = fullDiscount.zeroAmountVerified === true
+        || (fullDiscount.fullDiscountVerified === true && fullDiscount.dueTodayMinorUnits === 0);
+      const promotionApplied = zeroAmountVerified;
+      if (!promotionApplied) {
+        await reportProgress("Checkout 链接已生成，等待零金额订阅准备阶段复核", {
+          discountPercent: fullDiscount.discountPercent,
+          subtotalMinorUnits: fullDiscount.subtotalMinorUnits,
+          discountMinorUnits: fullDiscount.discountMinorUnits,
+          dueTodayMinorUnits: fullDiscount.dueTodayMinorUnits
+        });
       }
-      const promotionApplied = core.hasAppliedPromotion(checkout);
-      resolved = resolveNavigableCheckout(checkout) || resolved;
       const checkoutUrl = resolved.checkoutUrl;
       const route = resolved.route;
       const sessionKind = resolved.sessionKind;
       const promotionStatus = promotionApplied
         ? "applied"
-        : accountContext.eligibleCampaignIds.length > 0 && paymentPreflight.oneClickTrialEligible === false
-          ? "pending_payment_method"
-          : "not_offered";
+        : fullDiscount.dueTodayMinorUnits > 0
+          ? "nonzero_due"
+          : "pending_zero_amount_verification";
 
       await runtime.saveSession(session.path);
-      await reportProgress("US → TR 提链完成，结账链接已写入当前任务");
+      await reportProgress(promotionApplied
+        ? "US → TR → US 提链完成，零金额已验证并写入当前任务"
+        : "US → TR → US 协议提链完成；链接已写入，等待零金额验证");
       return Object.freeze({
         checkoutUrl,
         campaignId,
         promotionApplied,
+        fullDiscountVerified: zeroAmountVerified,
+        zeroAmountVerified,
+        discountPercent: fullDiscount.discountPercent,
+        subtotalMinorUnits: fullDiscount.subtotalMinorUnits,
+        discountMinorUnits: fullDiscount.discountMinorUnits,
+        dueTodayMinorUnits: fullDiscount.dueTodayMinorUnits,
         promotionStatus,
+        promotionVerification,
         sessionKind,
         route,
-        proxyFlow: Object.freeze(["US", "TR"]),
+        checkoutCountry: promotionVerification === "stripe_custom_checkout" ? "US" : authoritativeDiscount ? "TR" : "US",
+        proxyFlow: Object.freeze(["US", "TR", "US"]),
         account: Object.freeze({
           planType: accountContext.planType || "",
           eligibleCampaignCount: accountContext.eligibleCampaignIds.length,
@@ -1109,10 +2162,12 @@ class ChatGptCheckoutLinkClient {
 
 module.exports = {
   CHATGPT_ORIGIN,
+  CHECKOUT_ENDPOINT,
   CheckoutProtocolRuntime,
   ChatGptCheckoutLinkClient,
   authHeaders,
   normalizeAccountSession,
   normalizeCheckoutProxies,
-  rotateStickyProxyCredential
+  rotateStickyProxyCredential,
+  summarizeCouponEligibility
 };

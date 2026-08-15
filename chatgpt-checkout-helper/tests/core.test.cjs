@@ -8,8 +8,8 @@ test("buildCheckoutPayload returns the expected request body", () => {
     entry_point: "all_plans_pricing_modal",
     plan_name: "chatgptplusplan",
     billing_details: {
-      country: "PH",
-      currency: "PHP"
+      country: "US",
+      currency: "USD"
     },
     cancel_url: "https://chatgpt.com/?promo_campaign=plus-1-month-free#pricing",
     promo_campaign: {
@@ -54,9 +54,14 @@ test("short promotion payload matches the TR request country", () => {
       is_coupon_from_query_param: false
     }
   });
+  assert.deepEqual(core.buildShortPromotionPayload({
+    campaignId: "plus-1-month-free",
+    country: "US",
+    currency: "USD"
+  }).billing_details, { country: "US", currency: "USD" });
 });
 
-test("promotion update payload applies the campaign to an existing OAICS session", () => {
+test("promotion update payload applies the campaign to an existing OAICS or Stripe session", () => {
   assert.deepEqual(core.buildPromotionUpdatePayload({
     checkoutSessionId: "oaics_de70069a4d164634a4868109425dbf82",
     processorEntity: "openai_llc",
@@ -72,10 +77,14 @@ test("promotion update payload applies the campaign to an existing OAICS session
       is_coupon_from_query_param: false
     }
   });
-  assert.throws(() => core.buildPromotionUpdatePayload({
-    checkoutSessionId: "cs_live_fixture",
+  assert.equal(core.buildPromotionUpdatePayload({
+    checkoutSessionId: "cs_live_fixture123456",
     processorEntity: "openai_llc"
-  }), /oaics/);
+  }).checkout_session_id, "cs_live_fixture123456");
+  assert.throws(() => core.buildPromotionUpdatePayload({
+    checkoutSessionId: "invalid_fixture",
+    processorEntity: "openai_llc"
+  }), /oaics_\* 或 cs_\*/);
 });
 
 test("account promotion context follows account ordering and exposes only safe eligibility fields", () => {
@@ -126,9 +135,23 @@ test("promotion detection distinguishes the verified PH_SHORT discount from a ze
   const discounted = {
     checkout_state: {
       discountAmounts: [{ percentOff: 100, minorUnitsAmount: 98214 }],
-      total: { discount: { minorUnitsAmount: 98214 }, total: { minorUnitsAmount: 0 } }
+      total: {
+        subtotal: { minorUnitsAmount: 98214 },
+        discount: { minorUnitsAmount: 98214 },
+        total: { minorUnitsAmount: 0 }
+      }
     },
     promo_campaign: { promo_campaign_id: "plus-1-month-free" }
+  };
+  const halfPrice = {
+    checkout_state: {
+      discountAmounts: [{ percentOff: 50, minorUnitsAmount: 1000 }],
+      total: {
+        subtotal: { minorUnitsAmount: 2000 },
+        discount: { minorUnitsAmount: 1000 },
+        total: { minorUnitsAmount: 1000 }
+      }
+    }
   };
   const fullPrice = {
     checkout_state: {
@@ -139,13 +162,25 @@ test("promotion detection distinguishes the verified PH_SHORT discount from a ze
   };
   assert.equal(core.hasAppliedPromotion(discounted), true);
   assert.equal(core.hasAppliedPromotion(fullPrice), false);
+  assert.deepEqual(core.summarizeFullDiscountPromotion(discounted), {
+    fullDiscountVerified: true,
+    discountPercent: 100,
+    subtotalMinorUnits: 98214,
+    discountMinorUnits: 98214,
+    dueTodayMinorUnits: 0
+  });
+  assert.equal(core.hasFullDiscountPromotion(discounted), true);
+  assert.equal(core.hasFullDiscountPromotion(halfPrice), false);
+  assert.equal(core.hasFullDiscountPromotion({
+    scheduled_discount_preview: { percentOff: 100 }
+  }), false);
 });
 
 test("buildCheckoutPayload returns a fresh nested object", () => {
   const first = core.buildCheckoutPayload();
   first.billing_details.country = "XX";
 
-  assert.equal(core.buildCheckoutPayload().billing_details.country, "PH");
+  assert.equal(core.buildCheckoutPayload().billing_details.country, "US");
 });
 
 test("buildCheckoutUrl validates and encodes the session id", () => {

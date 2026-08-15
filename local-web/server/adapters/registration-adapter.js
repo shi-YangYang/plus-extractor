@@ -23,9 +23,13 @@ function normalizeRegistrationInput(input = {}, options = {}) {
 class RegistrationAdapter {
   constructor(options = {}) {
     this.mailboxReader = options.mailboxReader || new MailboxCodeReader(options);
-    this.registrationClient = Object.hasOwn(options, "registrationClient")
+    this.protocolRegistrationClient = Object.hasOwn(options, "protocolRegistrationClient")
+      ? options.protocolRegistrationClient
+      : Object.hasOwn(options, "registrationClient")
       ? options.registrationClient
       : options.registrationDriver || null;
+    this.roxyRegistrationClient = options.roxyRegistrationClient || null;
+    this.registrationClient = this.protocolRegistrationClient;
     this.identityFactory = options.identityFactory || generateRegistrationIdentity;
   }
 
@@ -33,14 +37,19 @@ class RegistrationAdapter {
     return {
       key: "registration",
       label: "iCloud email registration",
-      status: this.registrationClient ? "ready" : "mailbox_reader_ready",
-      ready: Boolean(this.registrationClient),
-      proxyRegion: "US",
+      status: this.protocolRegistrationClient || this.roxyRegistrationClient ? "ready" : "mailbox_reader_ready",
+      ready: Boolean(this.protocolRegistrationClient || this.roxyRegistrationClient),
+      proxyRegion: "REGISTRATION",
       capabilities: {
         mailboxProbe: true,
         verificationCodePolling: true,
-        protocolRegistration: Boolean(this.registrationClient),
-        browserFormAutomation: false,
+        protocolRegistration: Boolean(this.protocolRegistrationClient),
+        roxyBrowserRegistration: Boolean(this.roxyRegistrationClient),
+        browserFormAutomation: Boolean(this.roxyRegistrationClient),
+        automaticRoxyJpProxyAssignment: false,
+        roxyUsesExistingProfileProxy: Boolean(this.roxyRegistrationClient),
+        roxyProxySource: "existing_roxy_profile",
+        accountsPerRoxyWindow: 2,
         generatedProfile: true
       }
     };
@@ -66,31 +75,57 @@ class RegistrationAdapter {
     return this.mailboxReader.probe(input);
   }
 
-  async execute({ taskId, proxy, registration, reportProgress } = {}) {
+  registrationItem({ taskId, proxy, registration, reportProgress, signal } = {}) {
     const config = normalizeRegistrationInput(registration || {}, { identityFactory: this.identityFactory });
-    if (!this.registrationClient) {
-      throw pendingAdapter(
-        "REGISTRATION_PROTOCOL_CLIENT_PENDING",
-        "Mailbox code reader is ready; the ChatGPT registration protocol client is the next registration component."
-      );
-    }
-
-    return this.registrationClient.register({
+    return {
       taskId,
       email: config.email,
       identity: config.identity,
       proxy,
       reportProgress,
+      signal,
       readVerificationSnapshot: (options = {}) => this.mailboxReader.fetchSnapshot({
         ...config,
         proxy,
-        ...options
+        ...options,
+        signal: options.signal || signal
       }),
       waitForVerificationCode: (options = {}) => this.mailboxReader.waitForCode({
         ...config,
         proxy,
-        ...options
+        ...options,
+        signal: options.signal || signal
       })
+    };
+  }
+
+  async execute({ taskId, proxy, registration, registrationMode = "protocol", reportProgress, signal } = {}) {
+    const mode = String(registrationMode || "protocol").trim().toLowerCase();
+    const registrationClient = mode === "roxybrowser"
+      ? this.roxyRegistrationClient
+      : this.protocolRegistrationClient;
+    if (!registrationClient) {
+      throw pendingAdapter(
+        mode === "roxybrowser" ? "ROXY_REGISTRATION_CLIENT_PENDING" : "REGISTRATION_PROTOCOL_CLIENT_PENDING",
+        mode === "roxybrowser"
+          ? "RoxyBrowser registration client is not initialized."
+          : "Mailbox code reader is ready; the ChatGPT registration protocol client is the next registration component."
+      );
+    }
+    return registrationClient.register(this.registrationItem({ taskId, proxy, registration, reportProgress, signal }));
+  }
+
+  supportsBatchMode(registrationMode = "protocol") {
+    return registrationMode === "roxybrowser"
+      && Boolean(this.roxyRegistrationClient && typeof this.roxyRegistrationClient.registerBatch === "function");
+  }
+
+  async executeBatch({ items = [], registrationMode = "protocol" } = {}) {
+    if (!this.supportsBatchMode(registrationMode)) {
+      throw pendingAdapter("REGISTRATION_BATCH_MODE_PENDING", `Batch registration mode ${registrationMode} is not initialized.`);
+    }
+    return this.roxyRegistrationClient.registerBatch({
+      items: items.map((item) => this.registrationItem(item))
     });
   }
 }

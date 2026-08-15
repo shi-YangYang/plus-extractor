@@ -37,6 +37,7 @@ class BrowserProxyRelay {
       ...(Object.hasOwn(options, "firstHop") ? { firstHop: options.firstHop } : {}),
       firstHopRequired: options.firstHopRequired !== false
     };
+    this.lastTunnelFailure = null;
     this.sockets = new Set();
     this.server = http.createServer((_request, response) => {
       response.writeHead(501, { "Content-Type": "text/plain; charset=utf-8" });
@@ -70,6 +71,7 @@ class BrowserProxyRelay {
         ...this.tunnelOptions,
         timeoutMs: this.timeoutMs
       });
+      this.lastTunnelFailure = null;
       upstream = this.track(opened.socket);
       clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: Plus-Extractor-Local\r\n\r\n");
       const remainder = upstream.__localWebRemainder;
@@ -79,7 +81,14 @@ class BrowserProxyRelay {
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
       upstream.resume();
-    } catch {
+    } catch (error) {
+      const statusMatch = String(error && error.message || "").match(/HTTP\s+(\d{3})/i);
+      this.lastTunnelFailure = Object.freeze({
+        code: String(error && error.code || "PROXY_TUNNEL_FAILED").slice(0, 80),
+        status: Number(error && error.status) || 502,
+        upstreamStatus: statusMatch ? Number(statusMatch[1]) : null,
+        atMs: Date.now()
+      });
       if (!clientSocket.destroyed) {
         clientSocket.end("HTTP/1.1 502 Proxy Chain Failed\r\nConnection: close\r\n\r\n");
       }
@@ -119,10 +128,15 @@ class BrowserProxyRelay {
     }
     const previous = this.proxy;
     this.proxy = proxy;
+    this.lastTunnelFailure = null;
     const socketsReset = this.sockets.size;
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
     return Object.freeze({ previous, current: proxy, socketsReset });
+  }
+
+  getLastTunnelFailure() {
+    return this.lastTunnelFailure;
   }
 
   async close() {

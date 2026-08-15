@@ -49,6 +49,8 @@ class CheckoutLinkAdapter {
       taskId: context.taskId,
       accountSession: context.accountSession,
       proxies: context.proxies,
+      proxySessionId: context.proxySessionId,
+      checkoutSeed: context.checkoutSeed,
       reportProgress: context.reportProgress
     });
   }

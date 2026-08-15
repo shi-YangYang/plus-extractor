@@ -1,5 +1,8 @@
 "use strict";
 
+const WEBUI_BUILD = "20260811-23-protocol-registration-any-pool";
+window.__PLUS_EXTRACTOR_WEBUI_BUILD__ = WEBUI_BUILD;
+
 const API_BASE = localStorage.getItem("plusExtractorApiBase") || "http://127.0.0.1:17890";
 const FAILURE_SELECTION_GROUPS = Object.freeze([
   Object.freeze({
@@ -29,7 +32,12 @@ const state = {
   selectedExportTaskIds: new Set(),
   refreshing: false,
   batchRunning: false,
-  cardBindingSession: null
+  cardBindingSession: null,
+  activeTab: "workflow",
+  plusVerifying: false,
+  plusVerification: null,
+  operationSettingsSaving: false,
+  operationSettingsDirty: false
 };
 
 const elements = {
@@ -38,21 +46,34 @@ const elements = {
   apiAddress: document.querySelector("#api-address"),
   proxyForm: document.querySelector("#proxy-form"),
   proxyMessage: document.querySelector("#proxy-message"),
+  registrationPool: document.querySelector("#registration-pool"),
   usPool: document.querySelector("#us-pool"),
   trPool: document.querySelector("#tr-pool"),
+  registrationCount: document.querySelector("#registration-count"),
   usCount: document.querySelector("#us-count"),
   trCount: document.querySelector("#tr-count"),
+  registrationEndpoints: document.querySelector("#registration-endpoints"),
   usEndpoints: document.querySelector("#us-endpoints"),
   trEndpoints: document.querySelector("#tr-endpoints"),
+  registrationProbe: document.querySelector("#registration-probe"),
   usProbe: document.querySelector("#us-probe"),
   trProbe: document.querySelector("#tr-probe"),
   pipeline: document.querySelector("#pipeline"),
   taskList: document.querySelector("#task-list"),
   taskDetail: document.querySelector("#task-detail"),
   registrationForm: document.querySelector("#registration-form"),
+  accountImportFormat: document.querySelector("#account-import-format"),
   accountSource: document.querySelector("#account-source"),
+  accountSourceLabel: document.querySelector("#account-source-label"),
+  accountImportNote: document.querySelector("#account-import-note"),
   mailboxProbeButton: document.querySelector("#mailbox-probe-button"),
   registrationMessage: document.querySelector("#registration-message"),
+  registrationMode: document.querySelector("#registration-mode"),
+  registrationModeButtons: [...document.querySelectorAll("[data-registration-mode]")],
+  maxAccountOperations: document.querySelector("#max-account-operations"),
+  operationSettingsSave: document.querySelector("#operation-settings-save"),
+  operationSettingsSummary: document.querySelector("#operation-settings-summary"),
+  roxyBrowserStatus: document.querySelector("#roxy-browser-status"),
   createTaskButton: document.querySelector("#create-task-button"),
   refreshButton: document.querySelector("#refresh-button"),
   exportSelectAll: document.querySelector("#export-select-all"),
@@ -68,12 +89,26 @@ const elements = {
   batchCardProfileButton: document.querySelector("#batch-card-profile-button"),
   batchCardBindButton: document.querySelector("#batch-card-bind-button"),
   batchSubscribeButton: document.querySelector("#batch-subscribe-button"),
+  batchLimitNote: document.querySelector("#batch-limit-note"),
   sharedCardSection: document.querySelector("#shared-card-binding-section"),
   sharedCardCount: document.querySelector("#shared-card-binding-count"),
   sharedCardMount: document.querySelector("#shared-stripe-card"),
   sharedCardMessage: document.querySelector("#shared-card-binding-message"),
   sharedCardReload: document.querySelector("#batch-card-reload"),
   sharedCardSubmit: document.querySelector("#batch-card-submit"),
+  tabs: [...document.querySelectorAll("[data-tab]")],
+  tabPanels: [...document.querySelectorAll("[data-tab-panel]")],
+  plusSessionSource: document.querySelector("#plus-session-source"),
+  plusFileInput: document.querySelector("#plus-file-input"),
+  plusFileButton: document.querySelector("#plus-file-button"),
+  plusClearButton: document.querySelector("#plus-clear-button"),
+  plusVerifyButton: document.querySelector("#plus-verify-button"),
+  plusMessage: document.querySelector("#plus-verification-message"),
+  plusResults: document.querySelector("#plus-results"),
+  plusSummaryRequested: document.querySelector("#plus-summary-requested"),
+  plusSummaryActive: document.querySelector("#plus-summary-active"),
+  plusSummaryInactive: document.querySelector("#plus-summary-inactive"),
+  plusSummaryFailed: document.querySelector("#plus-summary-failed"),
   toast: document.querySelector("#toast")
 };
 
@@ -101,6 +136,86 @@ function setHealth(online, text) {
   elements.healthText.textContent = text;
 }
 
+function maximumAccountOperations() {
+  const configured = Number(
+    state.bootstrap
+    && state.bootstrap.operationSettings
+    && state.bootstrap.operationSettings.maxAccountOperations
+  );
+  return Number.isInteger(configured) && configured >= 1 && configured <= 30 ? configured : 10;
+}
+
+function renderOperationSettings() {
+  if (!state.bootstrap) return;
+  const settings = state.bootstrap.operationSettings || {};
+  const roxy = state.bootstrap.roxyBrowser || {};
+  const configuredMaximum = maximumAccountOperations();
+  const pendingMaximum = Number(elements.maxAccountOperations.value);
+  const maximum = state.operationSettingsDirty
+    && Number.isInteger(pendingMaximum)
+    && pendingMaximum >= 1
+    && pendingMaximum <= 30
+    ? pendingMaximum
+    : configuredMaximum;
+  const windows = Math.ceil(maximum / 2);
+  const configuredProxyProfiles = Number.isFinite(Number(roxy.configuredProxyProfiles))
+    ? Number(roxy.configuredProxyProfiles)
+    : Number(roxy.availableProfiles || 0);
+  const availableConfiguredProfiles = Number.isFinite(Number(roxy.availableConfiguredProfiles))
+    ? Number(roxy.availableConfiguredProfiles)
+    : configuredProxyProfiles;
+  if (!state.operationSettingsDirty) {
+    elements.maxAccountOperations.value = String(configuredMaximum);
+  }
+  const savedMode = settings.registrationMode === "roxybrowser" ? "roxybrowser" : "protocol";
+  const selectedMode = state.operationSettingsDirty && elements.registrationMode.value === "roxybrowser"
+    ? "roxybrowser"
+    : state.operationSettingsDirty
+      ? "protocol"
+      : savedMode;
+  elements.registrationMode.value = selectedMode;
+  for (const button of elements.registrationModeButtons) {
+    const selected = button.dataset.registrationMode === selectedMode;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    button.disabled = state.operationSettingsSaving;
+  }
+  const modeLabel = selectedMode === "roxybrowser" ? "RoxyBrowser WebUI" : "协议注册";
+  const proxyModeLabel = selectedMode === "roxybrowser"
+    ? "复用每个 Roxy 窗口已配置的代理，不改写窗口代理"
+    : "使用平台任意地区注册代理池";
+  elements.operationSettingsSummary.textContent = state.operationSettingsDirty
+    ? `待保存：${modeLabel}；N=${maximum} 个账号/轮；${proxyModeLabel}。`
+    : `${modeLabel}；N=${maximum} 个账号/轮；${proxyModeLabel}。RoxyBrowser 使用 ${windows} 个窗口，每窗口顺序处理 2 个账号。`;
+  const roxyCapacityReady = roxy.ready && availableConfiguredProfiles >= windows;
+  elements.roxyBrowserStatus.textContent = roxy.ready
+    ? `RoxyBrowser ${roxy.version || ""} 已连接：可见配置 ${roxy.availableProfiles || 0} 个，其中 ${configuredProxyProfiles} 个已配置代理、${availableConfiguredProfiles} 个当前空闲，当前打开 ${roxy.openedProfiles || 0} 个；当前 N 需要 ${windows} 个空闲窗口。WebUI 注册保留窗口现有代理，并在提交邮箱前校验 JP 出口。`
+    : `RoxyBrowser 本地控制未连接（${roxy.error || "ROXY_BRIDGE_UNAVAILABLE"}）。`;
+  elements.roxyBrowserStatus.className = `operation-settings-status ${roxyCapacityReady ? "ready" : "pending"}`;
+  elements.operationSettingsSave.disabled = state.operationSettingsSaving;
+  elements.maxAccountOperations.disabled = state.operationSettingsSaving;
+  elements.batchLimitNote.textContent = `每轮最多 ${maximum} 个账号；注册、绑卡提链和同步订阅共用该账号数上限。Roxy 注册对应 ${windows} 个窗口，每窗口 2 个账号，使用窗口自身已配置代理。`;
+  if (elements.accountImportFormat.value !== "access_token") {
+    elements.accountImportNote.textContent = selectedMode === "roxybrowser"
+      ? "RoxyBrowser WebUI 注册复用每个窗口已配置的代理，不改写窗口代理；提交邮箱前仍校验该窗口出口为 JP。"
+      : "协议注册使用平台任意地区代理池；同一次注册会校验 ChatGPT 与 Auth 出口国家一致。账户姓名自动生成为 First Last，年龄随机为 20–40 岁。";
+  }
+  updateRegistrationActions();
+}
+
+function selectTab(tabName) {
+  const selected = tabName === "plus" ? "plus" : "workflow";
+  state.activeTab = selected;
+  localStorage.setItem("plusExtractorActiveTab", selected);
+  for (const tab of elements.tabs) {
+    const active = tab.dataset.tab === selected;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
+  }
+  for (const panel of elements.tabPanels) panel.hidden = panel.dataset.tabPanel !== selected;
+}
+
 let toastTimer;
 function toast(message, kind = "") {
   clearTimeout(toastTimer);
@@ -120,12 +235,198 @@ function setRegistrationMessage(message = "", kind = "") {
   elements.registrationMessage.className = kind ? `form-message ${kind}` : "form-message";
 }
 
+function setPlusMessage(message = "", kind = "") {
+  elements.plusMessage.textContent = message;
+  elements.plusMessage.className = kind ? `form-message ${kind}` : "form-message";
+}
+
+function updatePlusControls() {
+  const proxiesReady = Boolean(state.bootstrap && state.bootstrap.proxyPools && state.bootstrap.proxyPools.US.configured);
+  const hasInput = Boolean(elements.plusSessionSource.value.trim());
+  elements.plusVerifyButton.disabled = state.plusVerifying || !hasInput || !proxiesReady;
+  elements.plusFileButton.disabled = state.plusVerifying;
+  elements.plusClearButton.disabled = state.plusVerifying || (!hasInput && !state.plusVerification);
+}
+
+function normalizeRawAccessTokenLine(value) {
+  let token = String(value || "").trim();
+  for (let pass = 0; pass < 3; pass += 1) {
+    const before = token;
+    const assignment = token.match(/^(?:access[_-]?token|at)\s*[:=]\s*(.+)$/i);
+    if (assignment) token = assignment[1].trim();
+    token = token.replace(/^Bearer[ \t]+/i, "").trim();
+    if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+      try {
+        const parsed = JSON.parse(token);
+        if (typeof parsed === "string") token = parsed.trim();
+      } catch {
+        if (token.startsWith("'") && token.endsWith("'")) token = token.slice(1, -1).trim();
+      }
+    }
+    if (token === before) break;
+  }
+  if (token.length < 20 || token.length > 20_000) return "";
+  return /^[A-Za-z0-9._~+\/-]+=*$/.test(token) ? token : "";
+}
+
+function parsePlusSessionSource(source) {
+  const value = String(source || "").trim();
+  if (!value) throw new Error("请导入至少一条完整 Session JSON 或 Access Token。");
+  try {
+    const whole = JSON.parse(value);
+    if (Array.isArray(whole)) return whole;
+    if (whole && typeof whole === "object") return [whole];
+    if (typeof whole === "string") {
+      const accessToken = normalizeRawAccessTokenLine(whole);
+      if (accessToken) return [{ accessToken }];
+    }
+  } catch {
+    // JSONL is parsed line by line below.
+  }
+  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.map((line, index) => {
+    try {
+      const parsed = JSON.parse(line);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("shape");
+      return parsed;
+    } catch {
+      const accessToken = normalizeRawAccessTokenLine(line);
+      if (accessToken) return { accessToken };
+      throw new Error(`第 ${index + 1} 行不是有效的 Session JSON 或 Access Token。`);
+    }
+  });
+}
+
+function resetPlusResults() {
+  state.plusVerification = null;
+  elements.plusSummaryRequested.textContent = "0";
+  elements.plusSummaryActive.textContent = "0";
+  elements.plusSummaryInactive.textContent = "0";
+  elements.plusSummaryFailed.textContent = "0";
+  elements.plusResults.replaceChildren();
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+  empty.textContent = "导入 Session JSON 或 Access Token 后开始验证。";
+  elements.plusResults.append(empty);
+}
+
+function renderPlusResults(verification) {
+  state.plusVerification = verification;
+  elements.plusSummaryRequested.textContent = String(verification.requested || 0);
+  elements.plusSummaryActive.textContent = String(verification.plusActive || 0);
+  elements.plusSummaryInactive.textContent = String(verification.noPlus || 0);
+  elements.plusSummaryFailed.textContent = String(verification.failed || 0);
+  elements.plusResults.replaceChildren();
+
+  const header = document.createElement("div");
+  header.className = "plus-result-header";
+  for (const label of ["序号", "账号", "结果", "套餐", "权益详情"]) {
+    const cell = document.createElement("span");
+    cell.textContent = label;
+    header.append(cell);
+  }
+  elements.plusResults.append(header);
+
+  for (const result of verification.results || []) {
+    const row = document.createElement("div");
+    row.className = "plus-result-row";
+    const index = document.createElement("span");
+    index.textContent = String(Number(result.index) + 1);
+    const email = document.createElement("code");
+    email.textContent = result.email || `第 ${Number(result.index) + 1} 条`;
+    const status = document.createElement("span");
+    status.className = `plus-result-status ${result.hasPlus ? "active" : result.ok ? "inactive" : "failed"}`;
+    status.textContent = result.hasPlus ? "PLUS 已到账" : result.ok ? "未到账" : "验证失败";
+    const plan = document.createElement("span");
+    plan.textContent = result.ok ? result.plan || "free" : "—";
+    const detail = document.createElement("span");
+    detail.className = "plus-result-detail";
+    if (!result.ok) detail.textContent = `${result.code || "PLUS_VERIFY_FAILED"} · ${result.message || "验证失败"}`;
+    else if (result.hasPlus) {
+      const dates = [result.trial ? "试用" : "订阅", result.renewsAt ? `续费 ${new Date(result.renewsAt).toLocaleString()}` : "", result.expiresAt ? `到期 ${new Date(result.expiresAt).toLocaleString()}` : ""].filter(Boolean);
+      detail.textContent = dates.join(" · ");
+    } else detail.textContent = result.hasActiveSubscription ? "存在其他有效订阅，但不是 Plus" : "没有有效 Plus 权益";
+    row.append(index, email, status, plan, detail);
+    elements.plusResults.append(row);
+  }
+}
+
+async function verifyImportedPlusSessions() {
+  let sessions;
+  try {
+    sessions = parsePlusSessionSource(elements.plusSessionSource.value);
+  } catch (error) {
+    setPlusMessage(error.message, "error");
+    return;
+  }
+  const maximum = Number(state.bootstrap && state.bootstrap.plusVerification && state.bootstrap.plusVerification.maxBatchSize) || 500;
+  if (sessions.length > maximum) {
+    setPlusMessage(`单批最多导入 ${maximum} 条 Session JSON 或 Access Token。`, "error");
+    return;
+  }
+  state.plusVerifying = true;
+  updatePlusControls();
+  elements.plusVerifyButton.textContent = `正在验证 ${sessions.length} 条…`;
+  setPlusMessage(`正在按最多 10 路并发验证 ${sessions.length} 个账号；结果仅保留脱敏权益字段。`);
+  try {
+    const payload = await api("/api/plus-verification", {
+      method: "POST",
+      body: JSON.stringify({ sessions })
+    });
+    renderPlusResults(payload.verification);
+    const result = payload.verification;
+    setPlusMessage(`验证完成：Plus 已到账 ${result.plusActive}，未到账 ${result.noPlus}，失败 ${result.failed}。`, result.failed ? "error" : "success");
+    toast(`Plus 验证完成 ${result.plusActive}/${result.requested}`);
+  } catch (error) {
+    setPlusMessage(error.message || String(error), "error");
+  } finally {
+    state.plusVerifying = false;
+    elements.plusVerifyButton.textContent = "开始批量验证";
+    updatePlusControls();
+  }
+}
+
 function updateRegistrationActions() {
   const pools = state.bootstrap && state.bootstrap.proxyPools;
-  const proxiesReady = Boolean(pools && pools.US.configured && pools.TR.configured);
+  const registrationMode = elements.registrationMode.value === "roxybrowser" ? "roxybrowser" : "protocol";
+  const roxy = state.bootstrap && state.bootstrap.roxyBrowser;
+  const protocolRegistrationReady = Boolean(pools && pools.REGISTRATION && pools.REGISTRATION.configured);
+  const requiredRoxyWindows = Math.ceil(maximumAccountOperations() / 2);
+  const roxyProxyCapacity = roxy && Number.isFinite(Number(roxy.availableConfiguredProfiles))
+    ? Number(roxy.availableConfiguredProfiles)
+    : Number(roxy && (roxy.configuredProxyProfiles ?? roxy.availableProfiles) || 0);
+  const roxyRegistrationReady = Boolean(
+    roxy && roxy.ready
+    && roxyProxyCapacity >= requiredRoxyWindows
+    && pools && pools.US && pools.US.configured
+  );
+  const registrationReady = registrationMode === "roxybrowser"
+    ? roxyRegistrationReady
+    : protocolRegistrationReady;
+  const downstreamProxiesReady = Boolean(pools && pools.US.configured && pools.TR.configured);
   const accountReady = Boolean(elements.accountSource.value.trim());
-  elements.mailboxProbeButton.disabled = !proxiesReady || !accountReady;
-  elements.createTaskButton.disabled = !proxiesReady || !accountReady;
+  const accessTokenMode = elements.accountImportFormat.value === "access_token";
+  elements.mailboxProbeButton.disabled = accessTokenMode || !protocolRegistrationReady || !accountReady;
+  elements.createTaskButton.disabled = !(accessTokenMode ? downstreamProxiesReady : registrationReady) || !accountReady;
+}
+
+function updateAccountImportMode() {
+  const accessTokenMode = elements.accountImportFormat.value === "access_token";
+  elements.mailboxProbeButton.hidden = accessTokenMode;
+  elements.accountSourceLabel.textContent = accessTokenMode
+    ? "批量导入 Access Token / Session JSON"
+    : "批量导入账号（每行一个，自动识别三条或四条连接线）";
+  elements.accountSource.placeholder = accessTokenMode
+    ? "每行一个裸 AT、Bearer AT、accessToken=AT，或完整 Session JSON / JSONL"
+    : "icloud邮箱---https://接码平台/messages/...\nicloud邮箱----https://icloud.biubiu007.com/console/open.php?mail=...&pwd=...&limit=1\nicloud邮箱----https://icloud-api.top/s/TOKEN/icloud邮箱";
+  elements.accountImportNote.textContent = accessTokenMode
+    ? "AT 会先通过 US 账号上下文验证，再作为已注册账号进入绑卡与提链流程；令牌只写入本机私有会话文件，任务列表与接口响应均不返回令牌。"
+    : elements.registrationMode.value === "roxybrowser"
+      ? "RoxyBrowser WebUI 注册复用每个窗口已配置的代理，不改写窗口代理；提交邮箱前仍校验该窗口出口为 JP。"
+      : "协议注册使用平台任意地区代理池；同一次注册会校验 ChatGPT 与 Auth 出口国家一致。账户姓名自动生成为 First Last，年龄随机为 20–40 岁。";
+  elements.createTaskButton.textContent = accessTokenMode ? "批量导入 AT 账号" : "批量导入任务";
+  setRegistrationMessage();
+  updateRegistrationActions();
 }
 
 function renderProxyRegion(region, summary) {
@@ -201,6 +502,22 @@ function stateClass(value) {
   return "";
 }
 
+function plusEligibilityBadge(eligibility) {
+  if (!eligibility || !["eligible", "ineligible", "unknown"].includes(eligibility.status)) return null;
+  const badge = document.createElement("span");
+  badge.className = `plus-eligibility-pill ${eligibility.status}`;
+  badge.textContent = eligibility.status === "eligible"
+    ? "\u6709 Plus \u8bd5\u7528\u8d44\u683c"
+    : eligibility.status === "ineligible"
+      ? "\u65e0 Plus \u8bd5\u7528\u8d44\u683c"
+      : "Plus \u8d44\u683c\u5f85\u68c0\u6d4b";
+  const evidence = [eligibility.couponStatus, eligibility.buttonVisible ? "offer_button" : ""]
+    .filter(Boolean)
+    .join(" + ");
+  badge.title = `${eligibility.campaignId || "plus-1-month-free"}${evidence ? ` \u00b7 ${evidence}` : ""}`;
+  return badge;
+}
+
 function setExportMessage(message = "", kind = "") {
   elements.exportMessage.textContent = message;
   elements.exportMessage.className = kind
@@ -221,7 +538,8 @@ function updateExportControls() {
   state.selectedExportTaskIds = new Set([...state.selectedExportTaskIds].filter((id) => ids.has(id)));
   const count = state.selectedExportTaskIds.size;
   const cardSessionActive = Boolean(state.cardBindingSession);
-  const concurrencyReady = count > 0 && count <= 10 && !state.batchRunning && !cardSessionActive;
+  const operationLimit = maximumAccountOperations();
+  const concurrencyReady = count > 0 && count <= operationLimit && !state.batchRunning && !cardSessionActive;
   const selectedTasks = tasks.filter((task) => state.selectedExportTaskIds.has(task.id));
   const everySelectedIn = (states) => selectedTasks.length === count
     && selectedTasks.every((task) => states.includes(task.state));
@@ -230,23 +548,25 @@ function updateExportControls() {
   ));
   const retryLimit = Number(state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.maxRetries) || 10;
   elements.batchRetryCount.max = String(retryLimit);
-  elements.exportCount.textContent = `已选择 ${count} 个账号${count > 10 ? " · 并发批次最多 10 个" : ""}`;
+  elements.exportCount.textContent = `已选择 ${count} 个账号${count > operationLimit ? ` · 每轮上限 ${operationLimit} 个` : ""}`;
   elements.exportAccountsButton.disabled = count === 0 || state.batchRunning || cardSessionActive;
   elements.selectFailedButton.disabled = !hasRetryableFailures || state.batchRunning || cardSessionActive;
   elements.batchRetryCount.disabled = state.batchRunning || cardSessionActive;
   elements.batchRegisterButton.disabled = !concurrencyReady || !everySelectedIn(["QUEUED", "REGISTERING_BLOCKED", "REGISTRATION_BLOCKED", "REGISTRATION_FAILED"]);
-  elements.batchExtractButton.disabled = !concurrencyReady || !everySelectedIn(["REGISTERED", "CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED"]);
-  elements.batchCardProfileButton.disabled = !concurrencyReady || !everySelectedIn(["CHECKOUT_LINK_READY", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"]);
-  elements.batchCardBindButton.disabled = !concurrencyReady || !everySelectedIn(["CHECKOUT_LINK_READY", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"]);
+  elements.batchExtractButton.disabled = !concurrencyReady || !everySelectedIn(["CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED"]);
+  const cardFlowStates = ["REGISTERED", "CARD_BINDING_READY", "CHECKOUT_LINK_READY", "CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"];
+  elements.batchCardProfileButton.disabled = !concurrencyReady || !everySelectedIn(cardFlowStates);
+  elements.batchCardBindButton.disabled = !concurrencyReady || !everySelectedIn(cardFlowStates);
   elements.batchSubscribeButton.disabled = !concurrencyReady || !everySelectedIn(["CARD_BOUND", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"]);
   elements.exportSelectAll.disabled = state.batchRunning || cardSessionActive;
   elements.exportSelectAll.checked = tasks.length > 0 && count === tasks.length;
   elements.exportSelectAll.indeterminate = count > 0 && count < tasks.length;
   if (!cardSessionActive) {
     elements.sharedCardCount.textContent = count
-      ? `已选择 ${count} 个账号；完成提链的账号可以共用下方卡片并发绑定。`
-      : "选择 1–10 个已完成提链的账号，然后点击“并发绑卡”。";
+      ? `已选择 ${count} 个账号；绑定成功后会立即在同一粘性会话提链。`
+      : `选择 1–${operationLimit} 个已注册账号，然后点击“绑卡并提链”。`;
   }
+  renderOperationSettings();
 }
 
 function renderTasks() {
@@ -255,7 +575,7 @@ function renderTasks() {
   if (!tasks.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "尚无任务。配置 US 和 TR 代理池后创建第一条流水线。";
+    empty.textContent = "尚无任务。先配置任意地区注册代理池；绑卡、提链和订阅继续使用独立的 US/TR 池。";
     elements.taskList.append(empty);
     state.selectedTaskId = null;
     updateExportControls();
@@ -291,10 +611,15 @@ function renderTasks() {
     const status = document.createElement("span");
     status.className = `state-pill ${stateClass(task.state)}`.trim();
     status.textContent = task.state;
+    const badges = document.createElement("span");
+    badges.className = "task-badges";
+    const eligibilityBadge = plusEligibilityBadge(task.plusEligibility);
+    if (eligibilityBadge) badges.append(eligibilityBadge);
+    badges.append(status);
     const time = document.createElement("div");
     time.className = "task-time";
     time.textContent = `${task.account && task.account.account ? `${task.account.account} · ` : ""}${new Date(task.updatedAt).toLocaleString()}`;
-    top.append(id, status);
+    top.append(id, badges);
     button.append(top, time);
     button.addEventListener("click", () => {
       state.selectedTaskId = task.id;
@@ -323,6 +648,11 @@ function renderTaskDetail() {
   const heading = document.createElement("div");
   const title = document.createElement("h3");
   title.textContent = task.state;
+  const titleLine = document.createElement("div");
+  titleLine.className = "detail-title-line";
+  titleLine.append(title);
+  const detailEligibilityBadge = plusEligibilityBadge(task.plusEligibility);
+  if (detailEligibilityBadge) titleLine.append(detailEligibilityBadge);
   const id = document.createElement("p");
   const profile = task.account && task.account.profile
     ? ` · ${task.account.profile.fullName} · ${task.account.profile.age} 岁`
@@ -330,11 +660,11 @@ function renderTaskDetail() {
   id.textContent = task.account
     ? `${task.account.account} · ${task.account.mailboxHost}${profile} · ${task.id}`
     : task.id;
-  heading.append(title, id);
+  heading.append(titleLine, id);
   const run = document.createElement("button");
   run.type = "button";
   run.className = "button primary";
-  const hostedCardInputRequired = ["CHECKOUT_LINK_READY", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED"].includes(task.state);
+  const hostedCardInputRequired = ["REGISTERED", "CARD_BINDING_READY", "CHECKOUT_LINK_READY", "CARD_BINDING_BLOCKED", "CARD_BINDING_FAILED"].includes(task.state);
   const trialRunnable = ["CARD_BOUND", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"].includes(task.state);
   const trialAdapterReady = Boolean(
     state.bootstrap
@@ -344,13 +674,14 @@ function renderTaskDetail() {
   );
   const promotionPending = trialRunnable
     && task.checkoutLink
-    && task.checkoutLink.promotionApplied !== true;
+    && task.checkoutLink.zeroAmountVerified !== true
+    && task.checkoutLink.fullDiscountVerified !== true;
   run.textContent = trialRunnable
     ? (promotionPending
-      ? "刷新优惠资格"
+      ? "准备零金额订阅"
       : (task.state === "CARD_BOUND" ? "一键订阅" : "重新尝试一键订阅"))
     : hostedCardInputRequired
-    ? (task.cardProfile ? "请使用下方开始绑卡" : "请先生成绑卡资料")
+    ? (task.cardProfile ? "请使用上方绑卡并提链" : "请先生成绑卡资料")
     : task.state.includes("BLOCKED") || task.state.includes("FAILED")
     ? "重试当前阶段"
     : task.state === "ABANDONED"
@@ -373,6 +704,14 @@ function renderTaskDetail() {
   const actions = document.createElement("div");
   actions.className = "detail-actions";
   actions.append(run);
+  if (["REGISTERING", "EXTRACTING_CHECKOUT_LINK", "REQUESTING_TRIAL"].includes(task.state)) {
+    const terminate = document.createElement("button");
+    terminate.type = "button";
+    terminate.className = "button danger";
+    terminate.textContent = "终止当前任务";
+    terminate.addEventListener("click", () => terminateTask(task.id, terminate));
+    actions.append(terminate);
+  }
   if (task.state !== "ABANDONED") {
     const abandon = document.createElement("button");
     abandon.type = "button";
@@ -402,24 +741,38 @@ function renderTaskDetail() {
     checkoutHeader.className = "checkout-result-header";
     const checkoutHeading = document.createElement("h4");
     checkoutHeading.textContent = "已提取结账链接";
-    const promotionEligible = task.checkoutLink.promotionApplied === true;
-    const promotionPending = task.checkoutLink.promotionStatus === "pending_payment_method";
+    const zeroAmountVerified = task.checkoutLink.zeroAmountVerified === true
+      || task.checkoutLink.fullDiscountVerified === true;
     const eligibilityLabel = document.createElement("span");
-    eligibilityLabel.className = `promotion-eligibility-label ${promotionEligible ? "eligible" : "not-eligible"}`;
-    eligibilityLabel.textContent = promotionEligible
-      ? "有优惠资格"
-      : promotionPending
-        ? "待绑卡后复核"
-        : "无优惠资格";
+    eligibilityLabel.className = `promotion-eligibility-label ${zeroAmountVerified ? "eligible" : "not-eligible"}`;
+    const protocolValidationFailed = task.checkoutLink.promotionStatus === "protocol_validation_failed";
+    eligibilityLabel.textContent = zeroAmountVerified
+      ? "本次应付 0 已确认"
+      : protocolValidationFailed
+        ? "链接已生成 · 协议验证待重试"
+      : Number(task.checkoutLink.dueTodayMinorUnits) > 0
+        ? "链接已生成 · 当前非0元"
+        : "链接已生成 · 待零金额验证";
     checkoutHeader.append(checkoutHeading, eligibilityLabel);
     const checkoutMeta = document.createElement("p");
     const flow = Array.isArray(task.checkoutLink.proxyFlow) ? task.checkoutLink.proxyFlow.join(" → ") : "US → TR";
-    const promotion = task.checkoutLink.promotionApplied
-      ? `${task.checkoutLink.campaignId || "活动"} 已应用`
-      : promotionPending
-        ? "普通链接已就绪，绑卡后重新校验活动"
-        : "当前账号未检测到活动资格";
-    checkoutMeta.textContent = `${flow} · ${promotion} · ${task.checkoutLink.route || "checkout"}`;
+    const promotion = zeroAmountVerified
+      ? `${task.checkoutLink.campaignId || "活动"} · Stripe 实时应付 0${Number(task.checkoutLink.discountPercent) >= 100 ? " · 100% 折扣" : ""}`
+      : "Stripe 实时金额尚未确认为 0";
+    const verification = zeroAmountVerified
+      ? "零应付已校验"
+      : protocolValidationFailed
+        ? "候选链接可复制，零金额订阅阶段将重新执行协议验证"
+      : Number(task.checkoutLink.dueTodayMinorUnits) > 0
+        ? "当前金额非0，订阅确认保持锁定"
+        : "等待零金额订阅准备阶段复核";
+    checkoutMeta.textContent = [
+      flow,
+      task.checkoutLink.checkoutCountry ? `账单 ${task.checkoutLink.checkoutCountry}` : "",
+      promotion,
+      verification,
+      task.checkoutLink.route || "checkout"
+    ].filter(Boolean).join(" · ");
     const checkoutCode = document.createElement("code");
     checkoutCode.textContent = task.checkoutLink.url;
 
@@ -448,8 +801,8 @@ function renderTaskDetail() {
   }
 
   let cardProfileResult = null;
-  const checkoutCompleted = task.stages.some((stage) => stage.key === "checkout_link" && stage.state === "COMPLETED");
-  if (checkoutCompleted) {
+  const accountRegistered = task.stages.some((stage) => stage.key === "registration" && stage.state === "COMPLETED");
+  if (accountRegistered) {
     cardProfileResult = document.createElement("section");
     cardProfileResult.className = "card-profile-result";
     const profileHeader = document.createElement("div");
@@ -461,6 +814,7 @@ function renderTaskDetail() {
     generateButton.className = "button subtle";
     generateButton.textContent = task.cardProfile ? "重新生成" : "生成资料";
     generateButton.disabled = task.state === "BINDING_CARD"
+      || task.state === "CARD_BINDING_READY"
       || task.state === "CARD_BOUND"
       || task.state === "TRIAL_ACTIVE"
       || task.state === "ABANDONED";
@@ -480,7 +834,7 @@ function renderTaskDetail() {
       });
       profileActions.append(retryCardButton);
     }
-    const canRebindAfterTrialBlock = ["TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"].includes(task.state);
+    const canRebindAfterTrialBlock = ["CHECKOUT_LINK_BLOCKED", "EXTRACTION_FAILED", "TRIAL_PAYMENT_BLOCKED", "TRIAL_PAYMENT_FAILED"].includes(task.state);
     profileHeader.append(profileHeading, profileActions);
     cardProfileResult.append(profileHeader);
 
@@ -525,7 +879,7 @@ function renderTaskDetail() {
     if (task.state !== "ABANDONED" && (!task.cardBinding || canRebindAfterTrialBlock)) {
       const sharedNotice = document.createElement("p");
       sharedNotice.className = "card-binding-privacy";
-      sharedNotice.textContent = "卡片输入已独立到账号列表上方；勾选 1–10 个账号后使用“并发绑卡”。";
+      sharedNotice.textContent = `卡片输入位于账号列表上方；勾选 1–${maximumAccountOperations()} 个账号后使用“绑卡并提链”。`;
       cardProfileResult.append(sharedNotice);
     }
   }
@@ -588,11 +942,14 @@ function renderTaskDetail() {
 
 function render() {
   if (!state.bootstrap) return;
+  renderOperationSettings();
+  renderProxyRegion("REGISTRATION", state.bootstrap.proxyPools.REGISTRATION);
   renderProxyRegion("US", state.bootstrap.proxyPools.US);
   renderProxyRegion("TR", state.bootstrap.proxyPools.TR);
   updateRegistrationActions();
   renderPipeline();
   renderTasks();
+  updatePlusControls();
 }
 
 async function refresh({ quiet = false } = {}) {
@@ -614,22 +971,26 @@ async function refresh({ quiet = false } = {}) {
 
 elements.proxyForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const US = elements.usPool.value.trim();
-  const TR = elements.trPool.value.trim();
-  if (!US || !TR) {
-    setProxyMessage("请同时填写 US 和 TR 代理池；保存会完整替换现有配置。", "error");
+  const values = Object.fromEntries(["REGISTRATION", "US", "TR"].map((region) => [
+    region,
+    elements[`${region.toLowerCase()}Pool`].value.trim()
+  ]));
+  const updates = Object.fromEntries(Object.entries(values).filter(([, value]) => value));
+  if (!Object.keys(updates).length) {
+    setProxyMessage("请至少填写一个需要新增或替换的代理池；空白池会保留现有配置。", "error");
     return;
   }
   setProxyMessage("正在保存到本地后端…");
   try {
     const payload = await api("/api/proxy-pools", {
       method: "PUT",
-      body: JSON.stringify({ US, TR })
+      body: JSON.stringify(updates)
     });
     state.bootstrap.proxyPools = payload.proxyPools;
+    elements.registrationPool.value = "";
     elements.usPool.value = "";
     elements.trPool.value = "";
-    setProxyMessage("代理池已保存；输入框已清空，凭据不会从 API 回传。", "success");
+    setProxyMessage(`已更新 ${Object.keys(updates).join("、")} 代理池；空白池保持原值，凭据不会从 API 回传。`, "success");
     render();
   } catch (error) {
     setProxyMessage(error.message, "error");
@@ -661,12 +1022,63 @@ for (const button of document.querySelectorAll(".probe-button")) {
 }
 
 elements.accountSource.addEventListener("input", updateRegistrationActions);
+elements.accountImportFormat.addEventListener("change", updateAccountImportMode);
+for (const button of elements.registrationModeButtons) {
+  button.addEventListener("click", () => {
+    elements.registrationMode.value = button.dataset.registrationMode === "roxybrowser" ? "roxybrowser" : "protocol";
+    state.operationSettingsDirty = true;
+    renderOperationSettings();
+  });
+}
+elements.maxAccountOperations.addEventListener("input", () => {
+  const value = Number(elements.maxAccountOperations.value);
+  if (Number.isInteger(value) && value >= 1 && value <= 30) {
+    state.operationSettingsDirty = true;
+    renderOperationSettings();
+  }
+});
+
+elements.operationSettingsSave.addEventListener("click", async () => {
+  const maxAccountOperations = Number(elements.maxAccountOperations.value);
+  if (!Number.isInteger(maxAccountOperations) || maxAccountOperations < 1 || maxAccountOperations > 30) {
+    setRegistrationMessage("每轮最大账号数 N 必须是 1–30 的整数。", "error");
+    elements.maxAccountOperations.focus();
+    return;
+  }
+  state.operationSettingsSaving = true;
+  renderOperationSettings();
+  setRegistrationMessage("正在保存注册方式与每轮账号数…");
+  try {
+    const payload = await api("/api/operation-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        maxAccountOperations,
+        registrationMode: elements.registrationMode.value
+      })
+    });
+    state.bootstrap.operationSettings = payload.settings;
+    state.bootstrap.batch = payload.batch;
+    state.bootstrap.roxyBrowser = payload.roxyBrowser;
+    state.operationSettingsDirty = false;
+    render();
+    setRegistrationMessage(
+      `设置已保存：每轮最多 ${payload.settings.maxAccountOperations} 个账号；注册方式为 ${payload.settings.registrationMode === "roxybrowser" ? "RoxyBrowser WebUI" : "协议"}。`,
+      "success"
+    );
+  } catch (error) {
+    setRegistrationMessage(error.message, "error");
+  } finally {
+    state.operationSettingsSaving = false;
+    renderOperationSettings();
+  }
+});
 
 elements.mailboxProbeButton.addEventListener("click", async () => {
+  if (elements.accountImportFormat.value === "access_token") return;
   const accountLine = elements.accountSource.value.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
   elements.mailboxProbeButton.disabled = true;
   elements.createTaskButton.disabled = true;
-  setRegistrationMessage("正在通过 US 代理检查接码平台…");
+  setRegistrationMessage("正在通过注册专用代理检查接码平台…");
   try {
     const payload = await api("/api/mailbox/probe", {
       method: "POST",
@@ -688,19 +1100,27 @@ elements.mailboxProbeButton.addEventListener("click", async () => {
 elements.registrationForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = elements.accountSource.value;
+  const format = elements.accountImportFormat.value === "access_token" ? "access_token" : "email_url";
   elements.mailboxProbeButton.disabled = true;
   elements.createTaskButton.disabled = true;
-  setRegistrationMessage("正在批量识别账号并创建本地注册任务…");
+  setRegistrationMessage(format === "access_token"
+    ? "正在通过 US 验证 AT 并创建可直接绑卡的账号任务…"
+    : "正在批量识别账号并创建使用任意地区代理的本地注册任务…");
   try {
+    const body = format === "access_token"
+      ? { format, sessions: parsePlusSessionSource(text) }
+      : { format, text };
     const payload = await api("/api/tasks/import", {
       method: "POST",
-      body: JSON.stringify({ text })
+      body: JSON.stringify(body)
     });
     const imported = payload.import;
     state.selectedTaskId = imported.tasks[0] && imported.tasks[0].id || null;
     elements.accountSource.value = "";
     await refresh({ quiet: true });
-    setRegistrationMessage(`已导入 ${imported.count} 个任务；每次并发执行最多选择 10 个。`, "success");
+    setRegistrationMessage(format === "access_token"
+      ? `已导入 ${imported.count} 个 AT 账号，均已进入 REGISTERED，可直接生成绑卡资料并执行绑卡提链。`
+      : `已导入 ${imported.count} 个任务；每轮最多选择 ${maximumAccountOperations()} 个账号。`, "success");
   } catch (error) {
     setRegistrationMessage(error.message, "error");
   } finally {
@@ -722,16 +1142,18 @@ async function runTask(taskId, button) {
 }
 
 async function subscribeTrial(task, button) {
-  const promotionPending = task.checkoutLink && task.checkoutLink.promotionApplied !== true;
+  const promotionPending = task.checkoutLink
+    && task.checkoutLink.zeroAmountVerified !== true
+    && task.checkoutLink.fullDiscountVerified !== true;
   const confirmed = window.confirm(
     promotionPending
-      ? "确认刷新绑卡后的优惠资格？系统只会在免费优惠已应用且当前应付为 0 时发送订阅请求。"
+      ? "确认准备零金额订阅？系统会重新加载原始 Checkout；只有 Stripe 实时应付确认为 0 时才发送订阅请求。"
       : "确认使用已绑定的默认支付方式订阅 ChatGPT Plus？当前优惠首月应付为 0；试用结束后将按结账页价格自动续费，除非提前取消。"
   );
   if (!confirmed) return;
 
   button.disabled = true;
-  button.textContent = promotionPending ? "正在刷新并校验优惠…" : "正在更新账单并订阅…";
+  button.textContent = promotionPending ? "正在刷新并校验实时金额…" : "正在更新账单并订阅…";
   try {
     await api(`/api/tasks/${task.id}/run`, {
       method: "POST",
@@ -797,6 +1219,26 @@ async function abandonTask(taskId, button) {
   }
 }
 
+async function terminateTask(taskId, button) {
+  const task = (state.bootstrap && state.bootstrap.tasks || []).find((candidate) => candidate.id === taskId);
+  const account = task && task.account && task.account.account || taskId;
+  if (!window.confirm(`确认终止 ${account} 当前正在执行的任务？已完成的数据会保留。`)) return;
+  button.disabled = true;
+  button.textContent = "正在终止…";
+  try {
+    await api(`/api/tasks/${taskId}/terminate`, { method: "POST", body: "{}" });
+    toast("终止信号已发送，正在回收浏览器窗口");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await refresh({ quiet: true });
+  } catch (error) {
+    toast(error.message, "error");
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = "终止当前任务";
+    }
+  }
+}
+
 async function exportSelectedAccounts() {
   const ids = [...state.selectedExportTaskIds];
   if (!ids.length) return;
@@ -839,7 +1281,7 @@ function selectFailedTasks() {
     return;
   }
   const failures = tasks.filter((task) => selectedGroup.states.includes(task.state));
-  const selected = failures.slice(0, 10);
+  const selected = failures.slice(0, maximumAccountOperations());
   state.selectedExportTaskIds = new Set(selected.map((task) => task.id));
   if (selected[0]) state.selectedTaskId = selected[0].id;
   renderTasks();
@@ -852,8 +1294,9 @@ function selectFailedTasks() {
 
 async function runSelectedBatch(stage, button) {
   const ids = [...state.selectedExportTaskIds];
-  if (!ids.length || ids.length > 10) {
-    setBatchMessage("请选择 1–10 个账号执行并发批次。", "error");
+  const operationLimit = maximumAccountOperations();
+  if (!ids.length || ids.length > operationLimit) {
+    setBatchMessage(`请选择 1–${operationLimit} 个账号执行本轮操作。`, "error");
     return;
   }
   const retryLimit = Number(state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.maxRetries) || 10;
@@ -879,7 +1322,11 @@ async function runSelectedBatch(stage, button) {
   state.batchRunning = true;
   updateExportControls();
   button.textContent = stage === "trial_payment" ? "等待全部加载…" : "并发执行中…";
-  setBatchMessage(`${labels[stage]}已启动：${ids.length}/10 个账号${stage === "trial_payment" ? "" : `，失败后最多自动重试 ${maxRetries} 次`}。`);
+  const registrationMode = state.bootstrap && state.bootstrap.operationSettings
+    && state.bootstrap.operationSettings.registrationMode === "roxybrowser"
+    ? `；Roxy 窗口 ${Math.ceil(ids.length / 2)} 个`
+    : "";
+  setBatchMessage(`${labels[stage]}已启动：${ids.length}/${operationLimit} 个账号${stage === "registration" ? registrationMode : ""}${stage === "trial_payment" ? "" : `，失败后最多自动重试 ${maxRetries} 次`}。`);
   try {
     const payload = await api("/api/tasks/batch/run", {
       method: "POST",
@@ -935,8 +1382,9 @@ async function generateCardProfile(taskId, button) {
 
 async function generateSelectedCardProfiles() {
   const ids = [...state.selectedExportTaskIds];
-  if (!ids.length || ids.length > 10) {
-    setBatchMessage("请选择 1–10 个账号生成绑卡信息。", "error");
+  const operationLimit = maximumAccountOperations();
+  if (!ids.length || ids.length > operationLimit) {
+    setBatchMessage(`请选择 1–${operationLimit} 个账号生成绑卡信息。`, "error");
     return;
   }
   state.batchRunning = true;
@@ -992,7 +1440,7 @@ async function resolveStripeForIntent(clientSecret, publishableKeys) {
   for (const key of publishableKeys || []) {
     const stripe = window.Stripe(key);
     const probe = await stripe.retrieveSetupIntent(clientSecret);
-    if (probe && probe.setupIntent) return stripe;
+    if (probe && probe.setupIntent) return { stripe, key };
     lastError = probe && probe.error || lastError;
   }
   throw lastError || new Error("没有匹配当前 SetupIntent 的 Stripe 公钥。");
@@ -1004,7 +1452,7 @@ function setSharedCardMessage(text, kind = "") {
   elements.sharedCardSection.dataset.state = kind === "error" ? "error" : kind === "success" ? "ready" : "running";
 }
 
-function resetSharedCardPanel(message = "尚未准备批量绑卡会话。") {
+function resetSharedCardPanel(message = "尚未准备绑卡并提链会话。") {
   elements.sharedCardMount.replaceChildren();
   elements.sharedCardSubmit.disabled = true;
   elements.sharedCardReload.disabled = true;
@@ -1019,10 +1467,13 @@ function mergeBatchTasks(tasks = []) {
   state.bootstrap.tasks = state.bootstrap.tasks.map((task) => updates.get(task.id) || task);
 }
 
-async function cancelCardPreparations(preparations = []) {
+async function cancelCardPreparations(preparations = [], failureByTask = new Map()) {
   await Promise.all(preparations.map((preparation) => api(`/api/tasks/${preparation.taskId}/card-binding/cancel`, {
     method: "POST",
-    body: JSON.stringify({ token: preparation.token })
+    body: JSON.stringify({
+      token: preparation.token,
+      failure: failureByTask.get(preparation.taskId) || null
+    })
   }).catch(() => null)));
 }
 
@@ -1056,15 +1507,16 @@ function readCardBindingRetryCount() {
 
 async function startBatchCardBinding(explicitIds = null) {
   const ids = Array.isArray(explicitIds) ? explicitIds : [...state.selectedExportTaskIds];
-  if (!ids.length || ids.length > 10) {
-    setBatchMessage("请选择 1–10 个账号执行并发绑卡。", "error");
+  const operationLimit = maximumAccountOperations();
+  if (!ids.length || ids.length > operationLimit) {
+    setBatchMessage(`请选择 1–${operationLimit} 个账号执行绑卡并提链。`, "error");
     return;
   }
   const maxRetries = readCardBindingRetryCount();
   if (maxRetries == null) return;
   if (state.cardBindingSession) await disposeCardBindingPanel();
   state.batchRunning = true;
-  elements.batchCardBindButton.textContent = "并发准备中…";
+  elements.batchCardBindButton.textContent = "绑卡并提链准备中…";
   elements.sharedCardCount.textContent = `正在同时准备 ${ids.length} 个账号的 SetupIntent…`;
   setSharedCardMessage("正在通过 US 会话并发准备全部账号…");
   updateExportControls();
@@ -1080,21 +1532,47 @@ async function startBatchCardBinding(explicitIds = null) {
     }
     const session = {
       taskIds: ids,
-      preparations: batch.preparations,
+      preparations: [],
       completedTaskIds: new Set(),
       maxRetries,
       retryDelayMs: Number(batch.retryDelayMs || state.bootstrap && state.bootstrap.batch && state.bootstrap.batch.retryDelayMs) || 0,
       preparationRetryRounds: Number(batch.retryRounds || 0),
       stripe: null,
+      stripeKey: "",
       cardElement: null,
+      submitting: false,
       disposed: false
     };
     state.cardBindingSession = session;
     await loadStripeJs();
-    session.stripe = await resolveStripeForIntent(batch.preparations[0].clientSecret, batch.preparations[0].publishableKeys);
-    const intentChecks = await Promise.all(batch.preparations.map((preparation) => session.stripe.retrieveSetupIntent(preparation.clientSecret)));
-    const unmatched = intentChecks.find((result) => !result || !result.setupIntent);
-    if (unmatched) throw unmatched.error || new Error("批量 SetupIntent 未使用同一 Stripe 公钥。 ");
+    const elementOwner = await resolveStripeForIntent(
+      batch.preparations[0].clientSecret,
+      batch.preparations[0].publishableKeys
+    );
+    const confirmationContexts = await Promise.all(batch.preparations.map(async (preparation) => {
+      try {
+        const resolved = await resolveStripeForIntent(preparation.clientSecret, preparation.publishableKeys);
+        return { ...preparation, confirmationStripe: resolved.stripe, stripeKey: resolved.key };
+      } catch (error) {
+        return { ...preparation, resolutionError: error };
+      }
+    }));
+    const compatible = confirmationContexts.filter((preparation) => (
+      !preparation.resolutionError && preparation.stripeKey === elementOwner.key
+    ));
+    const incompatible = confirmationContexts.filter((preparation) => !compatible.includes(preparation));
+    if (incompatible.length) {
+      const failures = new Map(incompatible.map((preparation) => [preparation.taskId, {
+        code: preparation.resolutionError ? "STRIPE_SETUP_INTENT_RESOLUTION_FAILED" : "STRIPE_ACCOUNT_MISMATCH",
+        message: preparation.resolutionError && preparation.resolutionError.message
+          || "该账号与当前卡片输入框不属于同一个 Stripe 账户。"
+      }]));
+      await cancelCardPreparations(incompatible, failures);
+    }
+    if (!compatible.length) throw new Error("没有 SetupIntent 与当前 Stripe 卡输入框匹配。");
+    session.preparations = compatible;
+    session.stripe = elementOwner.stripe;
+    session.stripeKey = elementOwner.key;
     if (session.disposed) return;
     const stripeElements = session.stripe.elements({ locale: "zh" });
     session.cardElement = stripeElements.create("card", {
@@ -1113,12 +1591,12 @@ async function startBatchCardBinding(explicitIds = null) {
     session.cardElement.on("ready", () => {
       elements.sharedCardSubmit.disabled = false;
       elements.sharedCardReload.disabled = false;
-      elements.sharedCardCount.textContent = `${batch.prepared}/${batch.requested} 个账号已准备；卡资料只需填写一次。`;
-      setSharedCardMessage("Stripe 卡输入框已就绪，可以并发确认。", "success");
+      elements.sharedCardCount.textContent = `${compatible.length}/${batch.requested} 个账号已准备；每个账号使用独立 Stripe 实例确认。`;
+      setSharedCardMessage("Stripe 卡输入框已就绪；卡资料填写一次，确认阶段同步并发。", "success");
     });
     session.cardElement.on("change", (event) => {
       if (event.error) setSharedCardMessage(event.error.message, "error");
-      else if (event.complete) setSharedCardMessage("卡资料填写完成，可以确认并发绑定。", "success");
+      else if (event.complete) setSharedCardMessage("卡资料填写完成，可以确认绑卡并提链。", "success");
       else setSharedCardMessage("请填写卡号、有效期和 CVC。");
     });
     session.cardElement.on("loaderror", (event) => {
@@ -1126,72 +1604,99 @@ async function startBatchCardBinding(explicitIds = null) {
       elements.sharedCardReload.disabled = false;
       setSharedCardMessage(event && event.error && event.error.message || "Stripe 卡输入框加载失败。", "error");
     });
-    setBatchMessage(`并发绑卡已准备 ${batch.prepared}/${batch.requested} 个账号；请在独立卡片中填写一次卡资料。`, batch.failures.length ? "error" : "success");
+    setBatchMessage(
+      `绑卡并提链已准备 ${compatible.length}/${batch.requested} 个账号；请在独立卡片中填写一次卡资料。`,
+      batch.failures.length || incompatible.length ? "error" : "success"
+    );
   } catch (error) {
     if (state.cardBindingSession) await disposeCardBindingPanel();
     setSharedCardMessage(error.message || String(error), "error");
     setBatchMessage(error.message || String(error), "error");
   } finally {
     state.batchRunning = false;
-    elements.batchCardBindButton.textContent = "并发绑卡";
+    elements.batchCardBindButton.textContent = "绑卡并提链";
     updateExportControls();
   }
 }
 
+const STRIPE_ELEMENT_RELEASE_DELAY_MS = 250;
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function createIndependentPaymentMethod(session, preparation) {
+  const result = await session.stripe.createPaymentMethod({
+    type: "card",
+    card: session.cardElement,
+    billing_details: preparation.billing,
+    allow_redisplay: "always"
+  });
+  await delay(STRIPE_ELEMENT_RELEASE_DELAY_MS);
+  if (result && result.error) throw result.error;
+  const paymentMethodId = String(result && result.paymentMethod && result.paymentMethod.id || "");
+  if (!/^pm_[A-Za-z0-9_-]{8,255}$/.test(paymentMethodId)) {
+    throw new Error("Stripe 未返回独立 payment method id。");
+  }
+  return paymentMethodId;
+}
+
+async function confirmPreparedBinding(session, preparation, paymentMethodId) {
+  if (!preparation.confirmationStripe || preparation.stripeKey !== session.stripeKey) {
+    throw new Error("SetupIntent 与当前卡片输入框不属于同一个 Stripe 账户。");
+  }
+  const result = await preparation.confirmationStripe.confirmCardSetup(preparation.clientSecret, {
+    payment_method: paymentMethodId,
+    set_as_default_payment_method: true
+  });
+  if (result && result.error) throw result.error;
+  if (!result || !result.setupIntent || result.setupIntent.status !== "succeeded") {
+    throw new Error(`SetupIntent 状态为 ${result && result.setupIntent && result.setupIntent.status || "unknown"}`);
+  }
+  const confirmedPaymentMethod = typeof result.setupIntent.payment_method === "string"
+    ? result.setupIntent.payment_method
+    : result.setupIntent.payment_method && result.setupIntent.payment_method.id;
+  if (confirmedPaymentMethod && confirmedPaymentMethod !== paymentMethodId) {
+    throw new Error("Stripe 返回了不同的 PaymentMethod。");
+  }
+  return confirmedPaymentMethod || paymentMethodId;
+}
+
 async function submitBatchCardBinding() {
   const session = state.cardBindingSession;
-  if (!session || !session.cardElement || session.disposed) return;
+  if (!session || !session.cardElement || session.disposed || session.submitting) return;
+  session.submitting = true;
   state.batchRunning = true;
   elements.sharedCardSubmit.disabled = true;
   elements.sharedCardReload.disabled = true;
-  setSharedCardMessage(`?????? ${session.preparations.length} ? SetupIntent?`);
+  setSharedCardMessage(`正在为 ${session.preparations.length} 个账号逐一生成独立 PaymentMethod；随后由独立 Stripe 实例同步确认。`);
   updateExportControls();
   try {
-    const bindings = [];
+    const independentBindings = [];
     const finalRejectedPreparations = [];
     let pending = [...session.preparations];
     let stripeRetryRounds = 0;
     let stripeRetryExecutions = 0;
-    let maxDispatchSkewMs = 0;
+    let paymentMethodExecutions = 0;
     let firstStripeFailure = null;
     while (pending.length) {
-      const roundDispatchTimes = [];
-      const confirmationPromises = pending.map((preparation) => {
-        roundDispatchTimes.push(performance.now());
-        return session.stripe.confirmCardSetup(preparation.clientSecret, {
-          payment_method: {
-            card: session.cardElement,
-            billing_details: preparation.billing,
-            allow_redisplay: "always"
-          },
-          set_as_default_payment_method: true
-        }).then((result) => {
-          if (result.error) throw result.error;
-          if (!result.setupIntent || result.setupIntent.status !== "succeeded") {
-            throw new Error(`SetupIntent ?????${result.setupIntent && result.setupIntent.status || "unknown"}`);
-          }
-          const paymentMethod = result.setupIntent.payment_method;
-          const paymentMethodId = typeof paymentMethod === "string" ? paymentMethod : paymentMethod && paymentMethod.id;
-          if (!paymentMethodId) throw new Error("Stripe ??? payment method id?");
-          return {
+      const retryable = [];
+      for (let index = 0; index < pending.length; index += 1) {
+        const preparation = pending[index];
+        setSharedCardMessage(
+          `正在生成第 ${index + 1}/${pending.length} 个独立 PaymentMethod（第 ${stripeRetryRounds + 1} 轮）…`
+        );
+        try {
+          paymentMethodExecutions += 1;
+          const paymentMethodId = await createIndependentPaymentMethod(session, preparation);
+          independentBindings.push({
             id: preparation.taskId,
             token: preparation.token,
-            setupIntentId: result.setupIntent.id,
+            setupIntentId: preparation.clientSecret.split("_secret_", 1)[0],
             paymentMethodId
-          };
-        });
-      });
-      if (roundDispatchTimes.length > 1) {
-        maxDispatchSkewMs = Math.max(maxDispatchSkewMs,
-          Math.max(...roundDispatchTimes) - Math.min(...roundDispatchTimes));
-      }
-      const settled = await Promise.allSettled(confirmationPromises);
-      const retryable = [];
-      for (let index = 0; index < settled.length; index += 1) {
-        const outcome = settled[index];
-        if (outcome.status === "fulfilled") bindings.push(outcome.value);
-        else {
-          firstStripeFailure = firstStripeFailure || outcome.reason;
+          });
+        } catch (error) {
+          firstStripeFailure = firstStripeFailure || error;
           retryable.push(pending[index]);
         }
       }
@@ -1203,19 +1708,54 @@ async function submitBatchCardBinding() {
       stripeRetryRounds += 1;
       stripeRetryExecutions += retryable.length;
       setSharedCardMessage(
-        `Stripe ???? ${retryable.length} ??${session.retryDelayMs / 1000} ?????? ${stripeRetryRounds}/${session.maxRetries}?`,
+        `PaymentMethod 生成有 ${retryable.length} 个失败，${session.retryDelayMs / 1000} 秒后按队列重试；轮次 ${stripeRetryRounds}/${session.maxRetries}。`,
         "error"
       );
       if (session.retryDelayMs) await new Promise((resolve) => setTimeout(resolve, session.retryDelayMs));
       pending = retryable;
     }
-    await cancelCardPreparations(finalRejectedPreparations);
-    if (!bindings.length) {
-      throw firstStripeFailure || new Error("Stripe ????? SetupIntent?");
+    await cancelCardPreparations(finalRejectedPreparations, new Map(finalRejectedPreparations.map((preparation) => [preparation.taskId, {
+      code: "STRIPE_PAYMENT_METHOD_CREATE_FAILED",
+      message: String(firstStripeFailure && firstStripeFailure.message || "Stripe 未生成独立 PaymentMethod。")
+    }])));
+    if (!independentBindings.length) {
+      throw firstStripeFailure || new Error("Stripe 未生成任何独立 PaymentMethod。");
     }
+    setSharedCardMessage(`已生成 ${independentBindings.length} 个独立 PaymentMethod；正在同步提交 confirmCardSetup…`);
+    const preparationByTask = new Map(session.preparations.map((preparation) => [preparation.taskId, preparation]));
+    const confirmationStarts = [];
+    const confirmationResults = await Promise.all(independentBindings.map(async (binding, index) => {
+      const preparation = preparationByTask.get(binding.id);
+      const startedAt = performance.now();
+      confirmationStarts.push(startedAt);
+      try {
+        const paymentMethodId = await confirmPreparedBinding(session, preparation, binding.paymentMethodId);
+        return { index, ok: true, binding: { ...binding, paymentMethodId } };
+      } catch (error) {
+        return { index, ok: false, preparation, error };
+      }
+    }));
+    const confirmedBindings = confirmationResults
+      .filter((result) => result.ok)
+      .sort((a, b) => a.index - b.index)
+      .map((result) => result.binding);
+    const rejectedResults = confirmationResults.filter((result) => !result.ok);
+    const rejectedPreparations = rejectedResults.map((result) => result.preparation).filter(Boolean);
+    const confirmationFailures = new Map(rejectedResults.map((result) => [result.preparation && result.preparation.taskId, {
+      code: String(result.error && result.error.code || "STRIPE_CARD_CONFIRM_FAILED"),
+      message: String(result.error && result.error.message || "Stripe 绑卡确认失败。")
+    }]));
+    for (const result of rejectedResults) firstStripeFailure = firstStripeFailure || result.error;
+    await cancelCardPreparations(rejectedPreparations, confirmationFailures);
+    if (!confirmedBindings.length) {
+      throw firstStripeFailure || new Error("Stripe.js 未确认任何 SetupIntent。");
+    }
+    const dispatchSkewMs = confirmationStarts.length > 1
+      ? Math.max(...confirmationStarts) - Math.min(...confirmationStarts)
+      : 0;
     const payload = await api("/api/tasks/batch/card-binding/complete", {
       method: "POST",
-      body: JSON.stringify({ bindings, maxRetries: session.maxRetries })
+      body: JSON.stringify({ bindings: confirmedBindings, maxRetries: session.maxRetries })
     });
     const batch = payload.batch;
     mergeBatchTasks(batch.tasks);
@@ -1230,15 +1770,16 @@ async function submitBatchCardBinding() {
     await disposeCardBindingPanel({ cancel: false });
     await refresh({ quiet: true });
     setBatchMessage(
-      `???????${completed}/${requested}????? ${session.preparationRetryRounds}/${session.maxRetries}?Stripe ?? ${stripeRetryRounds}/${session.maxRetries}?${stripeRetryExecutions} ?????US ???? ${batch.retryRounds}/${batch.maxRetries}?${batch.retryExecutions} ??????????? ${maxDispatchSkewMs.toFixed(3)} ms?`,
+      `绑卡并提链完成：${completed}/${requested}；独立 Stripe 实例同步确认 ${confirmedBindings.length}/${independentBindings.length}，调用偏差 ${dispatchSkewMs.toFixed(2)}ms；已核验默认卡 ${batch.cardBound || 0}/${requested}；候选链接 ${batch.candidateReady || batch.checkoutReady || 0}/${requested}；已验证实时0元 ${batch.zeroAmountVerified || 0}/${requested}；准备重试 ${session.preparationRetryRounds}/${session.maxRetries}；PaymentMethod 重试 ${stripeRetryRounds}/${session.maxRetries}（${stripeRetryExecutions} 次，共生成 ${paymentMethodExecutions} 次）；US 核验与并行提链重试 ${batch.retryRounds}/${batch.maxRetries}（${batch.retryExecutions} 次）。`,
       completed === requested ? "success" : "error"
     );
-    toast(`?????? ${completed}/${requested}`);
+    toast(`绑卡并提链完成 ${completed}/${requested}`);
   } catch (error) {
     await disposeCardBindingPanel();
     setSharedCardMessage(error && error.message || String(error), "error");
     setBatchMessage(error && error.message || String(error), "error");
   } finally {
+    session.submitting = false;
     state.batchRunning = false;
     updateExportControls();
   }
@@ -1270,5 +1811,37 @@ elements.refreshButton.addEventListener("click", async () => {
   refresh();
 });
 
+for (const tab of elements.tabs) {
+  tab.addEventListener("click", () => selectTab(tab.dataset.tab));
+}
+elements.plusSessionSource.addEventListener("input", () => {
+  setPlusMessage();
+  updatePlusControls();
+});
+elements.plusFileButton.addEventListener("click", () => elements.plusFileInput.click());
+elements.plusFileInput.addEventListener("change", async () => {
+  const file = elements.plusFileInput.files && elements.plusFileInput.files[0];
+  if (!file) return;
+  try {
+    elements.plusSessionSource.value = await file.text();
+    setPlusMessage(`已读取 ${file.name}，点击“开始批量验证”继续。`, "success");
+  } catch (error) {
+    setPlusMessage(error.message || "文件读取失败。", "error");
+  } finally {
+    elements.plusFileInput.value = "";
+    updatePlusControls();
+  }
+});
+elements.plusClearButton.addEventListener("click", () => {
+  elements.plusSessionSource.value = "";
+  setPlusMessage();
+  resetPlusResults();
+  updatePlusControls();
+});
+elements.plusVerifyButton.addEventListener("click", verifyImportedPlusSessions);
+
+selectTab(localStorage.getItem("plusExtractorActiveTab") || "workflow");
+updateAccountImportMode();
+resetPlusResults();
 refresh({ quiet: true });
 setInterval(() => refresh({ quiet: true }), 4_000);

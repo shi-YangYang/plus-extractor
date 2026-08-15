@@ -30,7 +30,7 @@ class TrialPaymentAdapter {
       status: ready ? "protocol_ready" : "subscription_client_missing",
       ready,
       proxyRegion: "US",
-      transport: "chatgpt_checkout_api_and_stripe_js",
+      transport: "chatgpt_taxes_stripe_js_and_form_confirm",
       requiresExplicitConfirmation: true,
       synchronizedBatch: this.supportsSynchronizedBatch(),
       maxBatchSize: 10

@@ -12,9 +12,9 @@
   const CHECKOUT_CONFIG = Object.freeze({
     planLabel: "ChatGPT Plus",
     planName: "chatgptplusplan",
-    countryCode: "PH",
-    countryLabel: "Philippines",
-    currency: "PHP",
+    countryCode: "US",
+    countryLabel: "United States",
+    currency: "USD",
     campaignId: "plus-1-month-free",
     entryPoint: "all_plans_pricing_modal",
     checkoutUiMode: "custom",
@@ -111,27 +111,39 @@
 
   function buildPromotionCheckoutPayload({
     oneClickTrial = true,
-    campaignId = CHECKOUT_CONFIG.campaignId
+    campaignId = CHECKOUT_CONFIG.campaignId,
+    country = "TR",
+    currency = "USD"
   } = {}) {
     return buildCheckoutPayload({
       promotion: true,
       oneClickTrial,
       campaignId,
-      country: "TR",
-      currency: "USD"
+      country,
+      currency
     });
   }
 
-  function buildShortPromotionPayload({ campaignId = CHECKOUT_CONFIG.campaignId } = {}) {
+  function buildShortPromotionPayload({
+    campaignId = CHECKOUT_CONFIG.campaignId,
+    country = "TR",
+    currency = "USD"
+  } = {}) {
     const normalizedCampaignId = typeof campaignId === "string" && campaignId.trim()
       ? campaignId.trim()
       : CHECKOUT_CONFIG.campaignId;
+    const normalizedCountry = /^[A-Z]{2}$/.test(String(country || "").trim().toUpperCase())
+      ? String(country).trim().toUpperCase()
+      : "US";
+    const normalizedCurrency = /^[A-Z]{3}$/.test(String(currency || "").trim().toUpperCase())
+      ? String(currency).trim().toUpperCase()
+      : "USD";
     return {
       entry_point: CHECKOUT_CONFIG.entryPoint,
       plan_name: CHECKOUT_CONFIG.planName,
       billing_details: {
-        country: "TR",
-        currency: "USD"
+        country: normalizedCountry,
+        currency: normalizedCurrency
       },
       promo_campaign: {
         promo_campaign_id: normalizedCampaignId,
@@ -148,8 +160,8 @@
     campaignId = CHECKOUT_CONFIG.campaignId
   } = {}) {
     const sessionId = typeof checkoutSessionId === "string" ? checkoutSessionId.trim() : "";
-    if (!/^oaics_[A-Za-z0-9_-]{16,160}$/.test(sessionId)) {
-      throw new TypeError("更新优惠需要有效的 oaics_* Checkout Session ID");
+    if (!/^(?:oaics_[A-Za-z0-9_-]{16,160}|cs_(?:live|test)_[A-Za-z0-9_-]{6,512})$/.test(sessionId)) {
+      throw new TypeError("更新优惠需要有效的 oaics_* 或 cs_* Checkout Session ID");
     }
     const normalizedEntity = typeof processorEntity === "string"
       ? processorEntity.trim().toLowerCase()
@@ -324,6 +336,61 @@
       )))
     ))) return true;
     return source.scheduled_discount_preview != null || source.immediate_discount_settings != null;
+  }
+
+  function summarizeFullDiscountPromotion(payload) {
+    const source = payload && payload.checkout_session && typeof payload.checkout_session === "object"
+      ? payload.checkout_session
+      : payload;
+    const state = source && source.checkout_state && typeof source.checkout_state === "object"
+      ? source.checkout_state
+      : {};
+    const lineItems = Array.isArray(state.lineItems) ? state.lineItems : [];
+    const discountAmounts = [
+      ...(Array.isArray(state.discountAmounts) ? state.discountAmounts : []),
+      ...lineItems.flatMap((item) => Array.isArray(item && item.discountAmounts) ? item.discountAmounts : [])
+    ];
+    const numberOrNull = (value) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    };
+    const topSubtotal = numberOrNull(state.total && state.total.subtotal && state.total.subtotal.minorUnitsAmount);
+    const topDiscount = numberOrNull(state.total && state.total.discount && state.total.discount.minorUnitsAmount);
+    const dueTodayMinorUnits = numberOrNull(state.total && state.total.total && state.total.total.minorUnitsAmount);
+    const lineSubtotal = lineItems.reduce((sum, item) => (
+      sum + (numberOrNull(item && item.subtotal && item.subtotal.minorUnitsAmount) || 0)
+    ), 0);
+    const lineDiscount = lineItems.reduce((sum, item) => (
+      sum + (numberOrNull(item && item.discount && item.discount.minorUnitsAmount) || 0)
+    ), 0);
+    const subtotalMinorUnits = topSubtotal == null ? (lineSubtotal || null) : topSubtotal;
+    const discountMinorUnits = topDiscount == null
+      ? (lineDiscount || discountAmounts.reduce((sum, item) => (
+        sum + (numberOrNull(item && item.minorUnitsAmount) || 0)
+      ), 0) || null)
+      : topDiscount;
+    const reportedPercent = discountAmounts.reduce((maximum, item) => (
+      Math.max(maximum, numberOrNull(item && item.percentOff) || 0)
+    ), 0);
+    const amountCoversSubtotal = subtotalMinorUnits != null
+      && subtotalMinorUnits > 0
+      && discountMinorUnits != null
+      && discountMinorUnits >= subtotalMinorUnits;
+    const discountPercent = Math.max(reportedPercent, amountCoversSubtotal ? 100 : 0);
+    const fullDiscountVerified = dueTodayMinorUnits === 0
+      && discountPercent >= 100
+      && amountCoversSubtotal;
+    return Object.freeze({
+      fullDiscountVerified,
+      discountPercent,
+      subtotalMinorUnits,
+      discountMinorUnits,
+      dueTodayMinorUnits
+    });
+  }
+
+  function hasFullDiscountPromotion(payload) {
+    return summarizeFullDiscountPromotion(payload).fullDiscountVerified;
   }
 
   function resolveHostedCheckoutUrl(payload) {
@@ -906,6 +973,8 @@
     summarizeAccountPromotionContext,
     summarizePaymentMethodsPreflight,
     hasAppliedPromotion,
+    summarizeFullDiscountPromotion,
+    hasFullDiscountPromotion,
     buildCheckoutUrl,
     resolveHostedCheckoutUrl,
     extractCheckoutSessionId,

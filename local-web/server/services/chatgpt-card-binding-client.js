@@ -1,13 +1,17 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const path = require("node:path");
 const { AppError } = require("../lib/errors");
 const { createStickyProxySession } = require("./chatgpt-protocol-registration-client");
 const {
+  CHECKOUT_ENDPOINT,
   CheckoutProtocolRuntime,
   authHeaders,
   normalizeAccountSession
 } = require("./chatgpt-checkout-link-client");
+
+const core = require(path.resolve(__dirname, "../../../chatgpt-checkout-helper/core.js"));
 
 const PAYMENT_METHOD_ENDPOINT = "/backend-api/payments/payment_method";
 const PAYMENT_METHODS_ENDPOINT = "/backend-api/payments/payment_methods";
@@ -63,6 +67,24 @@ function extractSetupIntentId(clientSecret) {
     throw new AppError(502, "SETUP_INTENT_SECRET_INVALID", "The payment-method endpoint returned an invalid SetupIntent client secret.");
   }
   return match[1];
+}
+
+function normalizeCheckoutSeed(payload) {
+  const checkoutSessionId = core.extractOpenAICheckoutSessionId(payload)
+    || core.extractCheckoutSessionId(payload);
+  if (!checkoutSessionId) {
+    throw new AppError(502, "CARD_BINDING_CHECKOUT_SEED_INVALID", "The temporary billing Checkout did not return a session identity.");
+  }
+  const processorEntity = String(payload && (
+    payload.processor_entity
+    || payload.processorEntity
+    || payload.checkout && (payload.checkout.processor_entity || payload.checkout.processorEntity)
+  ) || "openai_llc").trim() || "openai_llc";
+  return Object.freeze({
+    checkout_session_id: checkoutSessionId,
+    checkout_url: core.buildCheckoutUrl(checkoutSessionId),
+    processor_entity: processorEntity
+  });
 }
 
 function resolveAccountId(session) {
@@ -155,6 +177,16 @@ function tokenMatches(token, digest) {
   return Buffer.isBuffer(digest) && candidate.length === digest.length && crypto.timingSafeEqual(candidate, digest);
 }
 
+function canReusePreparedExitProof(record, expectedRegion, nowMs) {
+  const expected = String(expectedRegion || "").toUpperCase();
+  return Boolean(record
+    && record.exitProof
+    && record.exitProof.region === expected
+    && Number.isFinite(record.exitProof.verifiedAtMs)
+    && record.exitProof.verifiedAtMs <= nowMs
+    && nowMs < record.expiresAtMs);
+}
+
 class ChatGptCardBindingClient {
   constructor(options = {}) {
     this.runtimeFactory = options.runtimeFactory || (() => new CheckoutProtocolRuntime(options));
@@ -194,11 +226,20 @@ class ChatGptCardBindingClient {
     try {
       await reportProgress("正在通过 US 代理准备支付方式绑定会话");
       await runtime.open({ accountSession: session, proxy: stickyProxy });
-      await runtime.verifyExit("US");
+      const verifiedExit = await runtime.verifyExit("US");
       const authenticated = await runtime.readSession();
       const accountId = resolveAccountId(authenticated.session);
-      await reportProgress("US 出口与账号会话校验通过，正在创建一次性 SetupIntent");
-      const intent = await runtime.requestJson(PAYMENT_METHOD_ENDPOINT, {
+      await reportProgress("正在创建 US/USD 临时账单并初始化支付环境");
+      const checkoutSeed = normalizeCheckoutSeed(await runtime.requestJson(CHECKOUT_ENDPOINT, {
+        method: "POST",
+        headers: accountHeaders(authenticated.accessToken, accountId, CHECKOUT_ENDPOINT, {
+          "Content-Type": "application/json"
+        }),
+        body: core.buildBaselineCheckoutPayload(),
+        stage: "Isolated card-flow checkout seed"
+      }));
+      await reportProgress("临时账单身份已保存，正在读取 AT 并创建 SetupIntent");
+      const createSetupIntent = () => runtime.requestJson(PAYMENT_METHOD_ENDPOINT, {
         method: "POST",
         headers: accountHeaders(authenticated.accessToken, accountId, PAYMENT_METHOD_ENDPOINT, {
           "Content-Type": "application/json"
@@ -206,6 +247,14 @@ class ChatGptCardBindingClient {
         body: { account_id: accountId },
         stage: "Payment-method SetupIntent"
       });
+      let intent;
+      try {
+        intent = await createSetupIntent();
+      } catch (error) {
+        if (!error || error.code !== "CHECKOUT_PAYMENT_ACCOUNT_MISSING") throw error;
+        await reportProgress("临时账单已建立，支付账户仍在初始化；正在重试 SetupIntent");
+        intent = await createSetupIntent();
+      }
       const clientSecret = String(intent && (intent.client_secret || intent.clientSecret) || "").trim();
       const setupIntentId = extractSetupIntentId(clientSecret);
       const token = crypto.randomBytes(24).toString("base64url");
@@ -216,7 +265,14 @@ class ChatGptCardBindingClient {
         setupIntentId,
         clientSecret,
         tokenDigest: tokenDigest(token),
+        proxySessionId: sessionId,
+        checkoutSeed,
         stickyProxy,
+        exitProof: Object.freeze({
+          region: String(verifiedExit && verifiedExit.region || "US").toUpperCase(),
+          colo: String(verifiedExit && verifiedExit.colo || "").slice(0, 24),
+          verifiedAtMs: preparedAtMs
+        }),
         expiresAtMs
       }));
       await reportProgress("一次性卡输入会话已就绪；卡号、有效期和 CVC 将由 Stripe 托管输入框直接收集");
@@ -259,7 +315,19 @@ class ChatGptCardBindingClient {
     try {
       await reportProgress("Stripe 已确认 SetupIntent，正在通过 US 会话核验支付方式列表");
       await runtime.open({ accountSession: session, proxy: prepared.stickyProxy });
-      await runtime.verifyExit("US");
+      let proxyVerificationSource = "live";
+      try {
+        await runtime.verifyExit("US");
+      } catch (error) {
+        const nowMs = nowMilliseconds(this.now);
+        if (!(error instanceof AppError)
+            || error.code !== "CHECKOUT_PROXY_TRACE_FAILED"
+            || !canReusePreparedExitProof(prepared, "US", nowMs)) {
+          throw error;
+        }
+        proxyVerificationSource = "prepared";
+        await reportProgress("US 出口实时探针暂时未返回；复用本次 SetupIntent 准备阶段的 US 核验结果并继续复核");
+      }
       const authenticated = await runtime.readSession();
       const accountId = resolveAccountId(authenticated.session);
       if (accountId !== prepared.accountId) {
@@ -284,7 +352,10 @@ class ChatGptCardBindingClient {
       await reportProgress("支付方式已核验，任务仅保存品牌、尾号和有效期");
       return Object.freeze({
         ...summary,
+        checkoutSeed: prepared.checkoutSeed,
         proxyRegion: "US",
+        proxyVerificationSource,
+        flowSessionId: prepared.proxySessionId,
         boundAt: new Date(nowMilliseconds(this.now)).toISOString()
       });
     } catch (error) {
@@ -317,7 +388,9 @@ module.exports = {
   PAYMENT_METHOD_ENDPOINT,
   PAYMENT_METHODS_ENDPOINT,
   ChatGptCardBindingClient,
+  canReusePreparedExitProof,
   extractSetupIntentId,
+  normalizeCheckoutSeed,
   normalizeCardProfile,
   normalizePublishableKeys,
   orderPublishableKeys,

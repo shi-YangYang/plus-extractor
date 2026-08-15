@@ -7,6 +7,8 @@ const { AppError } = require("./errors");
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_PROXY_CONNECT_RESPONSE_TIMEOUT_MS = 10_000;
+const PROXY_ACCESS_DIAGNOSTIC_URL = "http://mayips.com/";
 
 function appError(status, code, message, cause) {
   const error = new AppError(status, code, message);
@@ -121,9 +123,8 @@ async function openProxySocket(proxy, options = {}) {
     }
     try {
       firstHopSocket.write(connectRequest(proxy.host, proxy.port, firstHop));
-      const header = await readUntil(
+      const header = await readHttpHeader(
         firstHopSocket,
-        Buffer.from("\r\n\r\n"),
         64 * 1024,
         timeoutMs,
         "FIRST_HOP_CONNECT_RESPONSE_TIMEOUT"
@@ -167,11 +168,14 @@ async function openProxyTunnel(host, port, proxy, options = {}) {
   const opened = await openProxySocket(proxy, { ...options, timeoutMs });
   try {
     opened.socket.write(connectRequest(host, port, proxy));
-    const header = await readUntil(
-      opened.socket,
-      Buffer.from("\r\n\r\n"),
-      64 * 1024,
+    const responseTimeoutMs = Math.min(
       timeoutMs,
+      Number(options.proxyConnectResponseTimeoutMs) || DEFAULT_PROXY_CONNECT_RESPONSE_TIMEOUT_MS
+    );
+    const header = await readHttpHeader(
+      opened.socket,
+      64 * 1024,
+      responseTimeoutMs,
       "PROXY_CONNECT_RESPONSE_TIMEOUT"
     );
     const response = parseHeaderBlock(header);
@@ -185,7 +189,89 @@ async function openProxyTunnel(host, port, proxy, options = {}) {
     return opened;
   } catch (error) {
     opened.socket.destroy();
+    if (options.diagnoseProxyAccess !== false && [
+      "PROXY_CONNECT_RESPONSE_TIMEOUT",
+      "PROXY_STREAM_FAILED",
+      "PROXY_STREAM_CLOSED"
+    ].includes(error && error.code)) {
+      const diagnostic = await diagnoseDirectProxyAccess(proxy, Math.min(timeoutMs, 5_000)).catch(() => null);
+      if (diagnostic && diagnostic.code === "PROXY_SOURCE_IP_FORBIDDEN") {
+        const mapped = appError(
+          502,
+          diagnostic.code,
+          `Proxy provider rejected source IP ${diagnostic.sourceIp}; update the provider access policy or use a supported outbound route.`
+        );
+        mapped.details = Object.freeze({
+          sourceIp: diagnostic.sourceIp,
+          providerStatus: diagnostic.status,
+          attemptedRoute: opened.route
+        });
+        throw mapped;
+      }
+      if (diagnostic && diagnostic.code === "PROXY_AUTH_REJECTED") {
+        throw appError(502, diagnostic.code, "Proxy provider rejected the configured username or password.");
+      }
+      if (opened.route === "first_hop" && diagnostic && diagnostic.reachable === true) {
+        return openProxyTunnel(host, port, proxy, {
+          ...options,
+          firstHop: false,
+          diagnoseProxyAccess: false,
+          timeoutMs
+        });
+      }
+    }
     throw error;
+  }
+}
+
+async function diagnoseDirectProxyAccess(proxy, timeoutMs = 5_000) {
+  let opened;
+  try {
+    opened = await openProxySocket(proxy, {
+      firstHop: false,
+      timeoutMs: Math.min(Number(timeoutMs) || 5_000, 5_000)
+    });
+    const target = new URL(PROXY_ACCESS_DIAGNOSTIC_URL);
+    const credentials = proxy && (proxy.username || proxy.password)
+      ? Buffer.from(`${proxy.username || ""}:${proxy.password || ""}`, "utf8").toString("base64")
+      : "";
+    const lines = [
+      `GET ${target.href} HTTP/1.1`,
+      `Host: ${target.host}`,
+      "User-Agent: Plus-Extractor-Proxy-Diagnostic/1.0",
+      "Connection: close"
+    ];
+    if (credentials) lines.push(`Proxy-Authorization: Basic ${credentials}`);
+    opened.socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+    const header = await readHttpHeader(
+      opened.socket,
+      64 * 1024,
+      Math.min(Number(timeoutMs) || 5_000, 5_000),
+      "PROXY_DIAGNOSTIC_RESPONSE_TIMEOUT"
+    );
+    const response = parseHeaderBlock(header);
+    const body = await collectToEnd(opened.socket, 64 * 1024, Math.min(Number(timeoutMs) || 5_000, 5_000));
+    const text = body.toString("utf8").slice(0, 4_096);
+    const forbidden = text.match(/forbidden\s+ip=([0-9a-f:.]+)\s+not\s+supported/i);
+    if (response.status === 403 && forbidden) {
+      return Object.freeze({
+        reachable: false,
+        code: "PROXY_SOURCE_IP_FORBIDDEN",
+        status: response.status,
+        sourceIp: forbidden[1]
+      });
+    }
+    if (response.status === 407) {
+      return Object.freeze({ reachable: false, code: "PROXY_AUTH_REJECTED", status: response.status });
+    }
+    return Object.freeze({
+      reachable: response.status >= 200 && response.status < 400,
+      code: "",
+      status: response.status,
+      sourceIp: null
+    });
+  } finally {
+    if (opened && opened.socket && !opened.socket.destroyed) opened.socket.destroy();
   }
 }
 
@@ -228,6 +314,67 @@ function readUntil(socket, delimiter, maxBytes, timeoutMs, timeoutCode) {
       reject(appError(502, "PROXY_STREAM_FAILED", `Proxy stream failed: ${error.code || "NETWORK_ERROR"}`, error));
     };
     const onEnd = () => {
+      cleanup();
+      reject(appError(502, "PROXY_STREAM_CLOSED", "Proxy gateway closed the connection early."));
+    };
+    if (inspect()) return;
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("end", onEnd);
+    socket.resume();
+  });
+}
+
+function readHttpHeader(socket, maxBytes, timeoutMs, timeoutCode) {
+  return new Promise((resolve, reject) => {
+    let buffer = socket.__localWebRemainder || Buffer.alloc(0);
+    socket.__localWebRemainder = null;
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(appError(504, timeoutCode, "Proxy response timed out."));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("end", onEnd);
+    };
+    const inspect = () => {
+      const crlfBoundary = buffer.indexOf(Buffer.from("\r\n\r\n"));
+      const lfBoundary = buffer.indexOf(Buffer.from("\n\n"));
+      let boundary = -1;
+      let delimiterLength = 0;
+      if (crlfBoundary >= 0 && (lfBoundary < 0 || crlfBoundary <= lfBoundary)) {
+        boundary = crlfBoundary;
+        delimiterLength = 4;
+      } else if (lfBoundary >= 0) {
+        boundary = lfBoundary;
+        delimiterLength = 2;
+      }
+      if (boundary < 0) {
+        if (buffer.length > maxBytes) {
+          cleanup();
+          reject(appError(502, "PROXY_HEADER_TOO_LARGE", "Proxy response header is too large."));
+        }
+        return false;
+      }
+      cleanup();
+      const end = boundary + delimiterLength;
+      socket.pause();
+      socket.__localWebRemainder = buffer.subarray(end);
+      resolve(buffer.subarray(0, end));
+      return true;
+    };
+    const onData = (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      inspect();
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(appError(502, "PROXY_STREAM_FAILED", `Proxy stream failed: ${error.code || "NETWORK_ERROR"}`, error));
+    };
+    const onEnd = () => {
+      if (inspect()) return;
       cleanup();
       reject(appError(502, "PROXY_STREAM_CLOSED", "Proxy gateway closed the connection early."));
     };
@@ -286,7 +433,7 @@ function collectToEnd(socket, maxBytes, timeoutMs) {
 }
 
 function parseHeaderBlock(headerBuffer) {
-  const lines = headerBuffer.toString("latin1").split("\r\n");
+  const lines = headerBuffer.toString("latin1").split(/\r?\n/);
   const statusMatch = lines.shift().match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})(?:\s+(.*))?$/i);
   if (!statusMatch) throw appError(502, "INVALID_HTTP_RESPONSE", "Upstream returned an invalid HTTP status line.");
   const headers = {};
@@ -447,6 +594,7 @@ async function requestTextThroughProxy(input, proxy, options = {}) {
 
 module.exports = {
   decodeChunked,
+  diagnoseDirectProxyAccess,
   openProxySocket,
   openProxyTunnel,
   parseHeaderBlock,

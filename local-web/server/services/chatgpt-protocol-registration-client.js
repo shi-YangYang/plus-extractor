@@ -7,10 +7,14 @@ const { AppError } = require("../lib/errors");
 const { BrowserProxyRelay } = require("./browser-proxy-relay");
 const { maskEmail } = require("./mailbox-code-reader");
 const { normalizeRegistrationIdentity } = require("./registration-identity");
+const { inspectPlusTrialEligibility } = require("./chatgpt-roxy-registration-client");
 
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 const AUTH_ORIGIN = "https://auth.openai.com";
 const ACCOUNT_API = `${AUTH_ORIGIN}/api/accounts`;
+const PROTOCOL_BROWSER_LOCALE = "en-US";
+const PROTOCOL_BROWSER_TIMEZONE = "UTC";
+const PROTOCOL_ACCEPT_LANGUAGE = "en-US,en;q=0.9";
 const DEFAULT_MODES = Object.freeze(["signup", "login_or_signup", "login"]);
 const NON_RETRYABLE_SESSION_ERRORS = new Set([
   "REGISTRATION_CLOUDFLARE_CHALLENGE"
@@ -57,6 +61,27 @@ function parseTrace(text) {
     .split(/\r?\n/)
     .map((line) => line.split("=", 2))
     .filter((parts) => parts.length === 2));
+}
+
+function requireRegistrationExitCountry(trace, service = "Registration") {
+  const country = String(trace && trace.loc || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(country)) {
+    throw new AppError(502, "REGISTRATION_EXIT_UNDETERMINED", `${service} protocol exit did not return a valid country.`);
+  }
+  return country;
+}
+
+function assertRegistrationExitConsistency(chatgptTrace, authTrace) {
+  const chatgptCountry = requireRegistrationExitCountry(chatgptTrace, "ChatGPT");
+  const authCountry = requireRegistrationExitCountry(authTrace, "Auth");
+  if (chatgptCountry !== authCountry) {
+    throw new AppError(
+      502,
+      "REGISTRATION_EXIT_MISMATCH",
+      `Registration proxy changed country between ChatGPT (${chatgptCountry}) and Auth (${authCountry}).`
+    );
+  }
+  return chatgptCountry;
 }
 
 function pageType(result) {
@@ -156,7 +181,14 @@ class AuthProtocolRuntime {
         ...(this.stealth ? ["--disable-blink-features=AutomationControlled"] : [])
       ]
     });
-    this.context = await this.browser.newContext({ proxy: { server: proxyServer }, locale: "en-US" });
+    this.context = await this.browser.newContext({
+      proxy: { server: proxyServer },
+      locale: PROTOCOL_BROWSER_LOCALE,
+      timezoneId: PROTOCOL_BROWSER_TIMEZONE,
+      extraHTTPHeaders: {
+        "Accept-Language": PROTOCOL_ACCEPT_LANGUAGE
+      }
+    });
     if (this.stealth) {
       await this.context.addInitScript(() => {
         try {
@@ -172,9 +204,10 @@ class AuthProtocolRuntime {
       timeout: this.timeoutMs
     });
     const chatgptTrace = parseTrace(await this.page.locator("body").innerText());
-    if (!traceResponse || traceResponse.status() !== 200 || chatgptTrace.loc !== "US") {
-      throw new AppError(502, "REGISTRATION_US_EXIT_REQUIRED", `ChatGPT protocol exit returned ${chatgptTrace.loc || "unknown"}.`);
+    if (!traceResponse || traceResponse.status() !== 200) {
+      throw new AppError(502, "REGISTRATION_EXIT_CHECK_FAILED", `ChatGPT protocol exit check returned HTTP ${traceResponse && traceResponse.status() || "unknown"}.`);
     }
+    requireRegistrationExitCountry(chatgptTrace, "ChatGPT");
 
     const routeHint = mode === "signup" ? "signup" : "login";
     const bootstrap = await this.page.evaluate(async ({ routeHint }) => {
@@ -251,9 +284,7 @@ class AuthProtocolRuntime {
       const text = await fetch(`/cdn-cgi/trace?_=${Date.now()}`, { cache: "no-store" }).then((response) => response.text());
       return Object.fromEntries(text.trim().split(/\r?\n/).map((line) => line.split("=", 2)).filter((parts) => parts.length === 2));
     });
-    if (authTrace.loc !== "US") {
-      throw new AppError(502, "REGISTRATION_AUTH_US_EXIT_REQUIRED", `Auth protocol exit returned ${authTrace.loc || "unknown"}.`);
-    }
+    this.exitCountry = assertRegistrationExitConsistency(chatgptTrace, authTrace);
     try {
       await this.page.waitForFunction(() => window.SentinelSDK && typeof window.SentinelSDK.token === "function", null, {
         timeout: Math.min(this.timeoutMs, 20_000)
@@ -703,6 +734,26 @@ class ChatGptProtocolRegistrationClient {
       if (!completion.authenticated) {
         throw new AppError(502, "REGISTRATION_SESSION_NOT_AUTHENTICATED", "Registration finished without an authenticated ChatGPT session.");
       }
+      const plusEligibility = await inspectPlusTrialEligibility(
+        runtime.page,
+        completion.authSession,
+        new Date().toISOString()
+      );
+      await reportProgress(
+        plusEligibility.status === "eligible"
+          ? "Protocol registration found an eligible Plus trial offer."
+          : plusEligibility.status === "ineligible"
+            ? "Protocol registration found no eligible Plus trial offer for this account."
+            : "Protocol registration completed, but the Plus trial precheck was inconclusive.",
+        {
+          protocolState: "PLUS_TRIAL_PRECHECK",
+          campaignId: plusEligibility.campaignId,
+          eligibilityStatus: plusEligibility.status,
+          couponStatus: plusEligibility.couponStatus,
+          buttonVisible: plusEligibility.buttonVisible,
+          source: plusEligibility.source
+        }
+      );
       const sessionPath = await runtime.saveSession(taskId, this.sessionDirectory);
       const authSessionPath = completion.authSession && typeof runtime.saveAuthSession === "function"
         ? await runtime.saveAuthSession(taskId, this.sessionDirectory, completion.authSession)
@@ -714,6 +765,7 @@ class ChatGptProtocolRegistrationClient {
         profile,
         registeredAt: new Date().toISOString(),
         transport: "auth_protocol",
+        plusEligibility,
         session: Object.freeze({
           kind: "playwright_storage_state",
           path: sessionPath,
@@ -733,8 +785,11 @@ class ChatGptProtocolRegistrationClient {
 }
 
 module.exports = {
+  assertRegistrationExitConsistency,
   ACCOUNT_API,
-  AuthProtocolRuntime,
+  PROTOCOL_ACCEPT_LANGUAGE,
+  PROTOCOL_BROWSER_LOCALE,
+  PROTOCOL_BROWSER_TIMEZONE,
   AuthProtocolRuntime,
   ChatGptProtocolRegistrationClient,
   buildAboutYouSubmission,
@@ -743,6 +798,7 @@ module.exports = {
   isCompletionPage,
   isOtpPage,
   parseTrace,
+  requireRegistrationExitCountry,
   normalizeSessionInitializationError,
   responseError
 };
